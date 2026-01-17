@@ -606,6 +606,9 @@ struct klp_callbacks {
 |--------------|----------------|----------------------|--------------------------|--------|
 | **ARM64** | Yes (unconditional) | WITH_ARGS | Yes | ✅ Fully Supported |
 | **x86_64** | Yes | WITH_ARGS | Conditional* | ✅ Fully Supported |
+| **PowerPC** | Yes | WITH_REGS | Yes | ✅ Fully Supported |
+| **s390** | Yes | WITH_REGS | Yes | ✅ Fully Supported |
+| **LoongArch** | Yes | WITH_ARGS | Yes | ✅ Fully Supported |
 | **ARM32** | ❌ No | WITH_REGS | ❌ No | ❌ Not Supported |
 
 *Requires `UNWINDER_ORC` or `STACK_VALIDATION` on x86_64
@@ -617,60 +620,441 @@ struct klp_callbacks {
 | **ARM64** | `13` | `arch/arm64/include/asm/thread_info.h` |
 | **x86_64** | `9` (generic) | `include/asm-generic/thread_info_tif.h` |
 | **PowerPC** | `6` | `arch/powerpc/include/asm/thread_info.h` |
+| **s390** | `31` | `arch/s390/include/asm/thread_info.h` |
+| **LoongArch** | `5` | `arch/loongarch/include/asm/thread_info.h` |
 | **ARM32** | ❌ Not defined | N/A |
 
-### Ftrace Implementation Differences
+### Architecture-Specific Files
 
-| Aspect | ARM64 | x86_64 | ARM32 |
-|--------|-------|--------|-------|
-| **Mode** | WITH_ARGS | WITH_ARGS | WITH_REGS |
-| **Compiler Option** | `-fpatchable-function-entry=2` | `-mfentry` | `-pg` |
-| **Entry Size** | 8 bytes (2 NOPs) | 5 bytes (call) | Variable |
-| **Entry Mechanism** | 2 NOPs → patched | `__fentry__` call | `__gnu_mcount_nc` |
+| Architecture | Ftrace Implementation | Stack Unwinding | Livepatch Integration |
+|--------------|----------------------|-----------------|----------------------|
+| **ARM64** | `arch/arm64/kernel/ftrace.c` | `arch/arm64/kernel/stacktrace.c` | Generic (no dedicated livepatch.c) |
+| **x86_64** | `arch/x86/kernel/ftrace.c` | `arch/x86/kernel/unwind_orc.c` | Generic (no dedicated livepatch.c) |
 
-### ARM64: DYNAMIC_FTRACE_WITH_ARGS
+> **Key Insight**: Neither ARM64 nor x86_64 has a dedicated `livepatch.c` file. All livepatch logic is architecture-independent in `kernel/livepatch/`, with only ftrace integration being architecture-specific.
+
+---
+
+## ARM64 Deep Dive
+
+### Why ARM64 Doesn't Need Dedicated livepatch.c
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              ARM64 Livepatch Architecture                   │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │         kernel/livepatch/ (Generic Code)            │   │
+│  │  ├── core.c      - Main orchestration               │   │
+│  │  ├── transition.c - Consistency model               │   │
+│  │  ├── patch.c     - Ftrace handler registration      │   │
+│  │  ├── shadow.c    - Shadow variables                 │   │
+│  │  └── state.c     - State tracking                   │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          │                                  │
+│                          │ Uses standard ftrace API        │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │       arch/arm64/kernel/ftrace.c                     │   │
+│  │  • FTRACE_WITH_ARGS implementation                   │   │
+│  │  • ftrace_caller assembly                           │   │
+│  │  • Register saving (x0-x8 only)                      │   │
+│  │  • Frame record creation                            │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                          │                                  │
+│                          ▼                                  │
+│  ┌─────────────────────────────────────────────────────┐   │
+│  │    arch/arm64/kernel/stacktrace.c                    │   │
+│  │  • Frame-pointer based unwinding                    │   │
+│  │  • Reliable stacktrace for klp_check_stack()        │   │
+│  │  • Stack bounds validation                          │   │
+│  └─────────────────────────────────────────────────────┘   │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### ARM64 FTRACE_WITH_ARGS Implementation
+
+#### Register Context Structure
 
 ```c
+// arch/arm64/include/asm/ftrace.h
 struct __arch_ftrace_regs {
-    unsigned long regs[9];  // x0 - x8 (argument registers)
+    /* x0 - x8: Function arguments and return value */
+    unsigned long regs[9];
+
+    #ifdef CONFIG_DYNAMIC_FTRACE_WITH_DIRECT_CALLS
     unsigned long direct_tramp;
-    unsigned long fp;       // x29
-    unsigned long lr;       // x30
-    unsigned long sp;
-    unsigned long pc;
+    #else
+    unsigned long __unused;
+    #endif
+
+    unsigned long fp;    // Frame pointer (x29)
+    unsigned long lr;    // Link register (x30)
+    unsigned long sp;    // Stack pointer
+    unsigned long pc;    // Program counter
 };
 ```
 
-**Compiler inserts 2 NOPs** before each function:
-- Patched to: `MOV X9, LR; BL ftrace_caller`
-- Saves x0-x8, fp, lr, sp, pc
-- Creates frame records for stack unwinding
+**Design Rationale**: ARM64 calling convention (AAPCS64):
+- x0-x7: Argument registers
+- x8: Indirect result / return value
+- x9-x18: Temporary caller-save registers (safe to clobber)
+- x19-x28: Callee-saved registers (preserved by compiler)
+- x29: Frame pointer
+- x30: Link register
 
-### x86_64: DYNAMIC_FTRACE_WITH_ARGS
+For livepatch, only x0-x8 needed since:
+1. Arguments must be preserved for inspection/modification
+2. x9-x18 can be clobbered (caller-save)
+3. x19-x29 are preserved by compiler
+4. x30 (LR) is explicitly saved
 
-```c
-// Uses generic ftrace_regs from linux/ftrace_regs.h
+#### Function Entry Patching Mechanism
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│              ARM64 Function Entry Patching                  │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. COMPILER OUTPUT (with -fpatchable-function-entry=2)    │
+│     ┌─────────────────────────────────────────────────┐    │
+│     │ func+00:  NOP        // 4 bytes                  │    │
+│     │ func+04:  NOP        // 4 bytes                  │    │
+│     │ func+08:  <actual function code>                │    │
+│     └─────────────────────────────────────────────────┘    │
+│                                                             │
+│  2. AFTER ftrace_init_nop() (kernel initialization)        │
+│     ┌─────────────────────────────────────────────────┐    │
+│     │ func+00:  MOV X9, LR  // Save link register      │    │
+│     │ func+04:  NOP                                    │    │
+│     │ func+08:  <actual function code>                │    │
+│     └─────────────────────────────────────────────────┘    │
+│                                                             │
+│  3. AFTER register_ftrace_function() (livepatch enabled)   │
+│     ┌─────────────────────────────────────────────────┐    │
+│     │ func+00:  MOV X9, LR  // Save link register      │    │
+│     │ func+04:  BL ftrace_caller                      │    │
+│     │ func+08:  <actual function code>                │    │
+│     └─────────────────────────────────────────────────┘    │
+│                                                             │
+│  4. WITH BTI (Branch Target Identification)                │
+│     ┌─────────────────────────────────────────────────┐    │
+│     │ func-04:  BTI C       // Branch target ID        │    │
+│     │ func+00:  MOV X9, LR                            │    │
+│     │ func+04:  BL ftrace_caller                      │    │
+│     │ func+08:  <actual function code>                │    │
+│     └─────────────────────────────────────────────────┘    │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-**Compiler calls `__fentry__`** at function entry:
-- 5-byte call site
-- Patched to: `jmp ftrace_caller`
-- ORC unwinder provides reliable stacktrace
+#### ftrace_caller Assembly Analysis
+
+```assembly
+// arch/arm64/kernel/entry-ftrace.S
+SYM_CODE_START(ftrace_caller)
+    bti c                        // [1] BTI protection
+
+    // [2] Save original SP
+    mov x10, sp
+
+    // [3] Allocate stack space
+    //     FREGS_SIZE = 96 bytes (12 * 8)
+    //     + 32 bytes for 2 frame records
+    sub sp, sp, #(FREGS_SIZE + 32)
+
+    // [4] Save function arguments (x0-x8)
+    stp x0, x1, [sp, #FREGS_X0]
+    stp x2, x3, [sp, #FREGS_X2]
+    stp x4, x5, [sp, #FREGS_X4]
+    stp x6, x7, [sp, #FREGS_X6]
+    str x8,     [sp, #FREGS_X8]
+
+    // [5] Save FP, LR, SP, PC
+    str x29, [sp, #FREGS_FP]
+    str x9,  [sp, #FREGS_LR]  // x9 contains saved LR
+    str x10, [sp, #FREGS_SP]  // x10 contains saved SP
+    str x30, [sp, #FREGS_PC]  // x30 is return address
+
+    // [6] Create frame records for proper stack unwinding
+    //     Frame record = {fp, lr}
+    stp x29, x9, [sp, #FREGS_SIZE + 16]    // Frame record 2
+    add x29, sp, #FREGS_SIZE + 16          // Update FP
+
+    stp x29, x30, [sp, #FREGS_SIZE]        // Frame record 1
+    add x29, sp, #FREGS_SIZE              // Update FP again
+
+    // [7] Call tracer function
+    sub x0, x30, #AARCH64_INSN_SIZE  // ip: current function
+    mov x1, x9                         // parent_ip: caller
+    mov x2, x28                        // op: ftrace_ops
+    mov x3, sp                         // regs: ftrace_regs pointer
+    bl ftrace_stub
+
+    // [8] Restore registers and return
+    ldp x0, x1, [sp, #FREGS_X0]
+    ldp x2, x3, [sp, #FREGS_X2]
+    ldp x4, x5, [sp, #FREGS_X4]
+    ldp x6, x7, [sp, #FREGS_X6]
+    ldr x8,     [sp, #FREGS_X8]
+    ldr x29, [sp, #FREGS_FP]
+    ldr x30, [sp, #FREGS_LR]
+    ldr x9,  [sp, #FREGS_PC]
+    add sp, sp, #FREGS_SIZE + 32
+    ret x9
+SYM_CODE_END(ftrace_caller)
+```
+
+**Key Points**:
+1. **BTI protection**: Branch Target Identification for security
+2. **Stack frame**: 96 + 32 = 128 bytes total
+3. **Frame records**: Enable reliable stack unwinding
+4. **Register preservation**: Only x0-x8 saved (minimal overhead)
+
+#### ARM64 Stack Frame Layout
+
+```
+High Address
+┌─────────────────────────────────────────┐
+│  Original SP (saved in x10)             │
+├─────────────────────────────────────────┤
+│  Frame Record 2 (ftrace_caller's frame) │
+│  ┌───────────────────────────────────┐  │
+│  │ FP (saved x29)                    │  │
+│  │ LR (saved x9)                     │  │
+│  └───────────────────────────────────┘  │
+├─────────────────────────────────────────┤
+│  Frame Record 1 (instrumented function) │
+│  ┌───────────────────────────────────┐  │
+│  │ FP (saved x29)                    │  │  <- x29 points here
+│  │ LR (saved x30)                    │  │
+│  └───────────────────────────────────┘  │
+├─────────────────────────────────────────┤
+│  FTRACE_REGS structure                  │
+│  ┌───────────────────────────────────┐  │
+│  │ x8                               │  │
+│  │ x7, x6                           │  │
+│  │ x5, x4                           │  │
+│  │ x3, x2                           │  │
+│  │ x1, x0                           │  │
+│  │ direct_tramp (if enabled)        │  │
+│  │ PC                               │  │
+│  │ SP                               │  │
+│  │ LR                               │  │
+│  │ FP                               │  │
+│  └───────────────────────────────────┘  │  <- SP points here
+└─────────────────────────────────────────┘
+Low Address
+```
+
+### ARM64 Stack Unwinding
+
+#### Frame Record Structure
+
+```c
+struct frame_record {
+    unsigned long fp;    // Pointer to previous frame record
+    unsigned long lr;    // Return address
+};
+```
+
+#### Unwinding Process
+
+```c
+// arch/arm64/kernel/stacktrace.c
+static inline bool notrace unwind_next(struct kunwind_state *state)
+{
+    struct frame_record *rec;
+
+    // [1] Read frame record from current FP
+    rec = (struct frame_record *)state->fp;
+
+    // [2] Check stack bounds
+    if (kunwind_is_unbounds_frame(state))
+        return false;
+
+    // [3] Handle special cases
+    if (kunwind_is_kretprobe_trampoline(state->fp))
+        // Handle kretprobe trampoline
+        return kunwind_unwind_kretprobe(state);
+
+    if (kunwind_is_fgraph_trampoline(state->fp))
+        // Handle ftrace_graph trampoline
+        return kunwind_unwind_fgraph(state);
+
+    // [4] Move to next frame
+    state->fp = rec->fp;
+    state->pc = rec->lr;
+
+    return true;
+}
+```
+
+**Special Trampoline Handling**:
+- `kretprobe_trampoline`: kretprobe return hook
+- `ftrace_graph_trampoline`: ftrace function graph tracer
+- `ftrace_regs_caller`: ftrace with regs
+
+### ARM64 Configuration
+
+```kconfig
+# arch/arm64/Kconfig
+config ARM64
+    select HAVE_DYNAMIC_FTRACE
+    select HAVE_DYNAMIC_FTRACE_WITH_ARGS \
+        if (GCC_SUPPORTS_DYNAMIC_FTRACE_WITH_ARGS || \
+            CLANG_SUPPORTS_DYNAMIC_FTRACE_WITH_ARGS)
+    select HAVE_DYNAMIC_FTRACE_WITH_DIRECT_CALLS \
+        if DYNAMIC_FTRACE_WITH_ARGS && DYNAMIC_FTRACE_WITH_CALL_OPS
+    select HAVE_DYNAMIC_FTRACE_WITH_CALL_OPS \
+        if (DYNAMIC_FTRACE_WITH_ARGS && !CFI && \
+            (CC_IS_CLANG || !CC_OPTIMIZE_FOR_SIZE))
+    select FTRACE_MCOUNT_USE_PATCHABLE_FUNCTION_ENTRY \
+        if DYNAMIC_FTRACE_WITH_ARGS
+
+    select HAVE_LIVEPATCH
+    select HAVE_RELIABLE_STACKTRACE
+    select FRAME_POINTER          # MANDATORY for livepatch
+```
+
+**Key Features**:
+- **FTRACE_WITH_ARGS**: Primary feature (not WITH_REGS)
+- **CALL_OPS**: Per-callsite ftrace_ops pointer support
+- **PATCHABLE_FUNCTION_ENTRY**: Uses compiler feature
+- **FRAME_POINTER**: Always enabled (mandatory)
+- **BTI**: Branch Target Identification support
+
+---
+
+## x86_64 Comparison
+
+### x86_64 FTRACE_WITH_ARGS
+
+```c
+// arch/x86/include/asm/ftrace.h
+// Uses generic ftrace_regs structure
+// HAVE_FTRACE_REGS_HAVING_PT_REGS is defined
+```
+
+#### Function Entry
+
+```assembly
+// Compiler generates:
+call __fentry__   // 5 bytes at function entry
+
+// Can be patched to:
+nop; nop; nop; nop; nop  // 5 bytes
+jmp ftrace_caller        // Direct jump (5 bytes)
+```
+
+#### Trampolines
+
+| Trampoline | Purpose |
+|------------|---------|
+| `ftrace_caller` | Basic tracing (minimal register save) |
+| `ftrace_regs_caller` | Full pt_regs save (for livepatch) |
+
+#### Stack Unwinding
+
+x86_64 uses **ORC (Oops Rewind Capability)** unwinder:
+
+```c
+// arch/x86/kernel/unwind_orc.c
+struct orc_entry {
+    s16 sp_offset;
+    s16 bp_offset;
+    unsigned sp_reg:4;
+    unsigned bp_reg:4;
+    unsigned type:2;
+    unsigned signal:1;
+};
+```
+
+**ORC Advantages**:
+- More sophisticated than frame pointers
+- Better performance (no fp chaining)
+- Build-time validation via objtool
+- Handles optimized code better
+
+---
+
+## ARM64 vs x86_64: Key Differences
+
+### Function Entry Instrumentation
+
+| Aspect | ARM64 | x86_64 |
+|--------|-------|--------|
+| Compiler Flag | `-fpatchable-function-entry=2` | `-mfentry` |
+| Entry Size | 2 NOPs (8 bytes) | 1 CALL (5 bytes) |
+| Patching | NOP → MOV + BL | CALL → NOP or JMP |
+| BTI Support | ✓ Yes | ✗ No |
+| Instructions | 2 independent patches | Single instruction |
+
+### Register State
+
+| Aspect | ARM64 | x86_64 |
+|--------|-------|--------|
+| Saved Registers | x0-x8, fp, lr, sp, pc (12 total) | Full pt_regs (all registers) |
+| Structure | `__arch_ftrace_regs` | `ftrace_regs` containing `pt_regs` |
+| Size | ~96 bytes | ~200+ bytes |
+| Overhead | Lower | Higher |
+| Debug Capability | Basic | Complete |
+
+### Trampolines
+
+| Aspect | ARM64 | x86_64 |
+|--------|-------|--------|
+| Trampolines | Single `ftrace_caller` | Two: `ftrace_caller` + `ftrace_regs_caller` |
+| Selection | Always `ftrace_caller` | Based on `FTRACE_OPS_FL_SAVE_REGS` |
+| Dynamic Alloc | No | Yes (CREATE_DYNAMIC) |
+| Direct Call | Via `direct_tramp` field | Via `orig_ax` in pt_regs |
+
+### Stack Unwinding
+
+| Aspect | ARM64 | x86_64 |
+|--------|-------|--------|
+| Method | Frame pointer (mandatory) | ORC tables (default) |
+| Data | Frame records {fp, lr} | ORC entries + .orc_unwind section |
+| Build Tools | Not needed | objtool required |
+| Reliability | High | Very High |
+| Performance | Good | Better (no fp overhead) |
+| Special Handling | ftrace_graph, kretprobe | Same + ORC lookup |
+
+### Memory and Performance
+
+| Metric | ARM64 | x86_64 |
+|--------|-------|--------|
+| Stack Usage | ~128 bytes | ~280+ bytes |
+| Register Save | 12 registers | 15+ registers |
+| Frame Records | 2 (16 bytes) | Variable |
+| Unwind Speed | O(stack_depth) | O(stack_depth) but faster |
+| Binary Size | Smaller | Larger (ORC data) |
+
+### Security Features
+
+| Feature | ARM64 | x86_64 |
+|---------|-------|--------|
+| BTI | ✓ Branch Target Identification | ✗ Not applicable |
+| PAC | ✓ Pointer Authentication (optional) | ✗ Not applicable |
+| RETPOLINE | Software emulation | Hardware support |
+| RETHPOLINE | Needed for spectre-v2 | Needed for spectre-v2 |
 
 ### ARM32: Why No Livepatch?
 
 **Missing Components**:
-- ❌ No `HAVE_LIVEPATCH` selection
-- ❌ No `TIF_PATCH_PENDING` flag
+- ❌ No `HAVE_LIVEPATCH` selection in Kconfig
+- ❌ No `TIF_PATCH_PENDING` flag in thread_info.h
 - ❌ No `HAVE_RELIABLE_STACKTRACE`
 - ❌ No architecture integration points
 
 **To Add Support Would Require**:
 1. Add `select HAVE_LIVEPATCH` to arch/arm/Kconfig
-2. Add TIF_PATCH_PENDING to thread_info.h
-3. Implement reliable stack unwinder OR add klp_update_patch_state() in all kthreads
-4. Verify DYNAMIC_FTRACE_WITH_REGS works for livepatch
-5. Add entry/exit path integration
+2. Add `TIF_PATCH_PENDING` to thread_info.h (find free bit)
+3. Implement reliable stack unwinder OR add `klp_update_patch_state()` in all kthreads
+4. Verify `DYNAMIC_FTRACE_WITH_REGS` works for livepatch
+5. Add entry/exit path integration in arch/arm/kernel/entry-*
 
 ---
 
