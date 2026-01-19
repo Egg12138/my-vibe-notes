@@ -21,6 +21,7 @@ Educational explanations with adaptive depth and format.
 2. **Locate** - According to summary, find what directory current topic belongs to, if not, design a big category, and current topic should be under this category
 3. **File Handling**: create directory, or touch file if needed
 4. **WRite** - Write output to target file, extension is .md
+> If current source code workspace is a git repo, add footer comment about current  version (priority tag > remote branch > commit hash)
 
 
 ## Flag
