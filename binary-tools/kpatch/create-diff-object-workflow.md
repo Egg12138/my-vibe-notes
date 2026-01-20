@@ -19,6 +19,58 @@ kpatch is a Linux dynamic kernel patching infrastructure that allows patching a 
 
 ---
 
+## Table of Contents
+
+- [Architecture Overview](#architecture-overview)
+  - [The Three Main Components](#the-three-main-components)
+- [create-diff-object: Deep Dive](#create-diff-object-deep-dive)
+  - [Function Signature](#function-signature)
+  - [Input Requirements](#input-requirements)
+- [Main Workflow: Step by Step](#main-workflow-step-by-step)
+  - [Phase 1: Initialization and Setup](#phase-1-initialization-and-setup)
+  - [Phase 2: Symbol Correlation](#phase-2-symbol-correlation)
+  - [Phase 3: Symbol Replacement Optimization](#phase-3-symbol-replacement-optimization)
+  - [Phase 4: Comparison and Change Detection](#phase-4-comparison-and-change-detection)
+    - [1. Relocation Comparison](#1-relocation-comparison)
+    - [2. Data Comparison](#2-data-comparison)
+    - [3. Line Number Filtering](#3-line-number-filtering)
+  - [Phase 5: Dependency Analysis and Inclusion](#phase-5-dependency-analysis-and-inclusion)
+  - [Phase 6: Special Section Processing](#phase-6-special-section-processing)
+  - [Phase 7: Output Generation](#phase-7-output-generation)
+    - [1. `.kpatch.funcs` / `.rela.kpatch.funcs`](#1-kpatchfuncs--relakpatchfuncs)
+    - [2. `.kpatch.dynrelas` / `.rela.kpatch.dynrelas`](#2-kpatchdynrelas--relakpatchdynrelas)
+    - [3. `.kpatch.strings`](#3-kpatchstrings)
+    - [4. `.kpatch.arch`](#4-kpatcharch)
+  - [Phase 8: Finalization](#phase-8-finalization)
+- [Key Data Structures](#key-data-structures)
+- [Architecture-Specific Handling](#architecture-specific-handling)
+  - [x86_64](#x86_64)
+  - [PPC64](#ppc64)
+  - [ARM64](#arm64)
+  - [S390](#s390)
+- [Complete kpatch-build Workflow](#complete-kpatch-build-workflow)
+  - [Step 1: Environment Setup](#step-1-environment-setup)
+  - [Step 2: Build Original Kernel](#step-2-build-original-kernel)
+  - [Step 3: Build Patched Kernel](#step-3-build-patched-kernel)
+  - [Step 4: Recompile Changed Objects](#step-4-recompile-changed-objects)
+  - [Step 5: Run create-diff-object](#step-5-run-create-diff-object)
+  - [Step 6: Link Patch Module](#step-6-link-patch-module)
+  - [Step 7: Build Final Module](#step-7-build-final-module)
+  - [Step 8: Load Patch](#step-8-load-patch)
+- [Example Walkthrough](#example-walkthrough)
+  - [Original Code](#original-code)
+  - [Patch](#patch)
+  - [Binary Analysis](#binary-analysis)
+- [Verification and Safety](#verification-and-safety)
+- [Exit Status Codes](#exit-status-codes)
+- [Key Binary Tools Summary](#key-binary-tools-summary)
+- [Related Files](#related-files)
+- [Limitations](#limitations)
+- [Supported Architectures](#supported-architectures)
+- [References](#references)
+
+---
+
 ## Architecture Overview
 
 ```

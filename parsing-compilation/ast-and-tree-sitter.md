@@ -6,6 +6,52 @@
 
 ---
 
+## Table of Contents
+
+- [Part 1: AST Fundamentals](#part-1-ast-fundamentals)
+  - [What is an AST?](#what-is-an-ast)
+  - [Example: `if (x > 0) { return x; }`](#example-if-x--0--return-x)
+  - [Why "Abstract"?](#why-abstract)
+- [Part 2: Tree-sitter Architecture](#part-2-tree-sitter-architecture)
+  - [Two-Component System](#two-component-system)
+  - [Core Data Structures](#core-data-structures)
+- [Part 3: GLR Parsing (Advanced)](#part-3-glr-parsing-advanced)
+  - [Multi-Version Stack Architecture](#multi-version-stack-architecture)
+  - [Parse Actions](#parse-actions)
+  - [Version Selection](#version-selection)
+- [Part 4: Memory Optimization](#part-4-memory-optimization)
+  - [Union Representation](#union-representation)
+  - [Inline Node Structure](#inline-node-structure)
+  - [Heap Node Structure](#heap-node-structure)
+  - [Reference Counting](#reference-counting)
+  - [Memory Pool](#memory-pool)
+- [Part 5: Incremental Parsing](#part-5-incremental-parsing)
+  - [Reuse Algorithm](#reuse-algorithm)
+  - [Edit Propagation](#edit-propagation)
+- [Part 6: Error Recovery](#part-6-error-recovery)
+  - [Two Strategies](#two-strategies)
+    - [Strategy 1: Recover to Previous State](#strategy-1-recover-to-previous-state)
+    - [Strategy 2: Skip Invalid Token](#strategy-2-skip-invalid-token)
+  - [Error Costs](#error-costs)
+- [Part 7: Grammar DSL](#part-7-grammar-dsl)
+  - [Example Grammar](#example-grammar)
+  - [Grammar Functions](#grammar-functions)
+- [Part 8: Named vs Anonymous Nodes](#part-8-named-vs-anonymous-nodes)
+  - [Concrete vs Abstract Trees](#concrete-vs-abstract-trees)
+  - [API Examples](#api-examples)
+- [Part 9: Parse Table Generation](#part-9-parse-table-generation)
+  - [LR(1) State Construction](#lr1-state-construction)
+  - [Core State Merging](#core-state-merging)
+  - [Conflict Resolution](#conflict-resolution)
+  - [Table Compression](#table-compression)
+- [Part 10: Tree Traversal](#part-10-tree-traversal)
+  - [Node API](#node-api)
+  - [Tree Cursor API (More Efficient)](#tree-cursor-api-more-efficient)
+- [Key Takeaways](#key-takeaways)
+- [Reference: Source Files](#reference-source-files)
+
+---
+
 ## Part 1: AST Fundamentals
 
 ### What is an AST?

@@ -6,6 +6,52 @@ Tree-sitter query language is an S-expression-based pattern matching language fo
 
 ---
 
+## Table of Contents
+
+- [1. Basic Pattern Syntax](#1-basic-pattern-syntax)
+  - [Pattern Structure](#pattern-structure)
+- [2. Captures](#2-captures)
+- [3. Operators](#3-operators)
+  - [Quantifiers](#quantifiers)
+  - [Alternatives `[]`](#alternatives-)
+  - [Anchors `.`](#anchors-)
+  - [Wildcards](#wildcards)
+- [4. Predicates (end with `?`)](#4-predicates-end-with-)
+  - [Text Comparison](#text-comparison)
+  - [Regex Matching](#regex-matching)
+  - [Node Properties](#node-properties)
+  - [Negation](#negation)
+- [5. Directives (end with `!`)](#5-directives-end-with-)
+  - [`#set!` - Set Metadata](#set---set-metadata)
+  - [`#select-adjacent!` - Filter Adjacent Nodes](#select-adjacent---filter-adjacent-nodes)
+  - [`#strip!` - Remove Text from Capture](#strip---remove-text-from-capture)
+- [6. Special Nodes](#6-special-nodes)
+  - [ERROR Nodes](#error-nodes)
+  - [MISSING Nodes](#missing-nodes)
+  - [Supertypes](#supertypes)
+  - [Negated Fields](#negated-fields)
+  - [Anonymous Nodes](#anonymous-nodes)
+- [7. Query API](#7-query-api)
+  - [Creating Queries](#creating-queries)
+  - [Query Information](#query-information)
+  - [Executing Queries](#executing-queries)
+  - [Iterating Captures](#iterating-captures)
+  - [Data Structures](#data-structures)
+- [8. Common Patterns](#8-common-patterns)
+  - [Syntax Highlighting](#syntax-highlighting)
+  - [Code Navigation (ctags-style)](#code-navigation-ctags-style)
+  - [Local Variable Tracking](#local-variable-tracking)
+  - [Language Injection](#language-injection)
+  - [Refactoring Helpers](#refactoring-helpers)
+- [9. Implementation Notes](#9-implementation-notes)
+  - [Query Processing](#query-processing)
+  - [Performance Considerations](#performance-considerations)
+  - [Error Handling](#error-handling)
+- [10. Syntax Reference](#10-syntax-reference)
+- [Key Files Reference](#key-files-reference)
+
+---
+
 ## 1. Basic Pattern Syntax
 
 Queries use **S-expressions** (Lisp-like syntax) to match nodes:

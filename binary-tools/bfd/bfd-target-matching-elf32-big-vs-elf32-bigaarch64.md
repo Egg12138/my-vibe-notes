@@ -1,5 +1,29 @@
 # BFD Target Matching: Why `elf32-big` Instead of `elf32-bigaarch64`
 
+## Table of Contents
+
+- [Problem Statement](#problem-statement)
+- [Root Cause](#root-cause)
+- [BFD Architecture Overview](#bfd-architecture-overview)
+  - [Key Components](#key-components)
+  - [Target Vector Structure](#target-vector-structure)
+- [The Two Targets in Question](#the-two-targets-in-question)
+  - [`elf32-bigaarch64` (Architecture-Specific)](#elf32-bigaarch64-architecture-specific)
+  - [`elf32-big` (Generic Fallback)](#elf32-big-generic-fallback)
+- [Match Priority Algorithm](#match-priority-algorithm)
+- [Target Selection Flow](#target-selection-flow)
+- [ELF Machine Validation](#elf-machine-validation)
+- [Diagnosis Steps](#diagnosis-steps)
+  - [1. Check ELF Header](#1-check-elf-header)
+  - [2. Verify AArch64 ILP32 Support](#2-verify-aarch64-ilp32-support)
+  - [3. Check Build Configuration](#3-check-build-configuration)
+- [Common Scenarios](#common-scenarios)
+- [Key Code References](#key-code-references)
+- [Solutions](#solutions)
+- [Related Concepts](#related-concepts)
+
+---
+
 ## Problem Statement
 
 When running `strip --verbose *.so` on an AArch64 ILP32 (AArch32) shared library, the output shows:
