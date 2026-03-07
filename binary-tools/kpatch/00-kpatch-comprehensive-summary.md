@@ -211,7 +211,7 @@ Kpatch works at **function level** - entire functions are replaced, not individu
 
 The `create-diff-object` tool:
 - Compiles with `-ffunction-sections -fdata-sections`
-- Compares ELF sections byte-by-byte
+- Compares ELF **sections byte-by-byte**
 - Tracks dependency chains (functions → strings → relocations)
 
 ### 3. Symbol Resolution
@@ -246,6 +246,7 @@ The `create-diff-object` tool:
 | `kpatch-build-user-guide-cn.md` | Complete CLI reference | Intermediate |
 | `create-diff-object-workflow.md` | Binary differencing engine | Advanced |
 | `qemu-end-to-end-example.md` | Hands-on tutorial | Beginner |
+| `troubleshooting-symbol-info-mismatch.md` | GCC cold section separation errors | Advanced |
 
 ### Kernel Documentation
 
@@ -275,7 +276,7 @@ The `create-diff-object` tool:
 4. **Practical Usage**
    - QEMU-based testing
    - Sample modules
-   - Troubleshooting
+   - Troubleshooting (symbol info mismatch, GCC cold section separation)
 
 ---
 

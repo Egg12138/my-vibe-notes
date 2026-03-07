@@ -55,10 +55,10 @@ Quick start
 
 > NOTE: While kpatch is designed to work with any recent Linux
 kernel on any distribution, `kpatch-build` has specifically been tested and
-confirmed to work on Fedora and RHEL.  It has also been known to work on Oracle
+confirmed to work on **Fedora and RHEL**.  It has also been known to work on Oracle
 Linux, Ubuntu, Debian, and Gentoo.
 
-First, make a source code patch against the kernel tree using diff, git, or
+First, **make a source code patch against the kernel tree** using diff, git, or
 quilt.
 
 As a contrived example, let's patch /proc/meminfo to show VmallocChunk in ALL
@@ -144,25 +144,25 @@ patch module.  Most of its work is performed by the kpatch-build script
 which uses a utility named `create-diff-object` to compare changed objects.
 
 The primary steps in kpatch-build are:
-- Build the unstripped vmlinux for the kernel
+- Build the **unstripped vmlinux** for the kernel
 - Patch the source tree
-- Rebuild vmlinux and monitor which objects are being rebuilt.
+- **Rebuild vmlinux** and **monitor which objects are being rebuilt**.
   These are the "changed objects".
-- Recompile each changed object with `-ffunction-sections -fdata-sections`,
+- Recompile each **changed object** with `-ffunction-sections -fdata-sections`,
   resulting in the changed patched objects
 - Unpatch the source tree
 - Recompile each changed object with `-ffunction-sections -fdata-sections`,
   resulting in the changed original objects
 - For every changed object, use `create-diff-object` to do the following:
 	* Analyze each original/patched object pair for patchability
-	* Add `.kpatch.funcs` and `.rela.kpatch.funcs` sections to the output object.
-	The kpatch core module uses this to determine the list of functions
-	that need to be redirected using ftrace.
+	* **Add `.kpatch.funcs` and `.rela.kpatch.funcs` sections** to the output object.
+	The kpatch core module uses this to determine the list of **functions
+	that need to be redirected using ftrace**.
 	* Add `.kpatch.dynrelas` and `.rela.kpatch.dynrelas` sections to the output object.
-	This will be used to resolve references to non-included local
-	and non-exported global symbols. These relocations will be resolved by the kpatch core module.
+	This will be used to **resolve references to non-included local
+	and non-exported global symbols**. These relocations will be resolved by the kpatch core module.
 	* Generate the resulting output object containing the new and modified sections
-- Link all the output objects into a cumulative object
+- **Link all the output objects** into a cumulative object
 - Generate the patch module
 
 
