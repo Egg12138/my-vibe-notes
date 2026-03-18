@@ -16,6 +16,8 @@ This directory contains comprehensive documentation about ARM SMMUv3 (System MMU
 - Kconfig symbol analysis and dependencies
 - DMA execution flow with and without IOMMU
 - Runtime behavior comparison (module loaded vs not loaded)
+- ACPI IORT call chain and probe ordering
+- Deferred probe replay mechanism
 - SVA (Shared Virtual Addressing) implementation
 
 ---
@@ -58,6 +60,34 @@ Covers:
 - Per-device state changes
 - Runtime decision points
 - Memory allocation differences
+
+### 4. [ACPI IORT Call Chain](./acpi-iort-call-chain.md)
+
+Covers:
+- What is ACPI IORT and why it matters for SMMU
+- Complete _DSD property parsing flow
+- CONFIG_ARM_SMMU_V3=n vs CONFIG_ARM_SMMU_V3=m comparison
+- The critical `iort_iommu_xlate()` decision point
+- IS_ENABLED() macro behavior
+- Timeline comparison for different configurations
+
+**Key code paths:**
+- `acpi_bus_scan()` → `acpi_init_properties()` → `_DSD parsing`
+- `acpi_dma_configure_id()` → `iort_iommu_xlate()` → `iommu_ops_from_fwnode()`
+
+### 5. [Deferred Probe Replay](./deferred-probe-replay.md)
+
+Covers:
+- What is deferred probe and why it matters for SMMU
+- How devices get deferred when SMMU is not ready
+- Complete replay sequence when SMMU module loads
+- Key data structures (deferred_probe_pending_list, iommu_device_list)
+- Debug tips for deferred probe issues
+
+**Key mechanisms:**
+- `driver_deferred_probe_add()` - Add device to deferred list
+- `driver_deferred_probe_trigger()` - Trigger replay of all deferred devices
+- `deferred_probe_work_func()` - Work function that replays probes
 
 ---
 
@@ -159,5 +189,5 @@ ARM_SMMU_FEAT_PRI      (1 << 4)   // Page Request Interface
 Repository: linux
 Tag: v5.10-rc7
 Commit: 0477e92881850d44910a7e94fc2c46f96faa131f
-Generated: 2026-02-06
+Generated: 2026-03-13
 -->
