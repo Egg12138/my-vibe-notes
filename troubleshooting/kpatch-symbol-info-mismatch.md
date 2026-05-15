@@ -1,0 +1,1 @@
+../binary-tools/kpatch/troubleshooting-symbol-info-mismatch.md
