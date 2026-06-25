@@ -1,1 +1,1 @@
-../linux/userspace-build/util-linux-destdir-install-perms.md
+../linux/util-linux-destdir-install-perms.md
