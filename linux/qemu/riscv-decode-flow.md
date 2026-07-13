@@ -76,45 +76,322 @@ ctx->base.pc_next += ctx->cur_insn_len;   // PC 前进
 
 三层抽象：**字段 → 格式 → 模式**。
 
-#### 字段（field）——定义位位置
+#### 2.2.1 overview — decodetree.py 的五层 Python 对象
+
+`decodetree.py` 将 `.decode` 文件的声明式语法解析为五个 Python 类，最终输出 C 代码：
+
+| `.decode` 语法 | Python 类 | 职责 |
+|---------------|-----------|------|
+| `%rs2 20:5` | `Field` / `MultiField` / `FunctionField` | 位位置 → extract 表达式 |
+| `&r rd rs1 rs2` | `Arguments` | 参数列表 → `typedef struct { int rd; ... } arg_r;` |
+| `@r ....... ..... &r %rs2...` | `Format` | 把 Arguments + Fields 组装 → `_extract_*()` 函数 |
+| `add ... 0110011 @r` | `Pattern` | 固定位 + Format → `trans_add()` 调用 |
+| `{ }` / `[ ]` | `IncMultiPattern` / `ExcMultiPattern` / `Tree` | switch-case 树节点 |
+
+---
+
+#### 2.2.2 核心解析：`parse_generic` — 格式模板的逐 token 处理
+
+以 `@r` 和 `@b` 两个格式为例，展示 `parse_generic`（`decodetree.py:1043`）的数据流。
+
+##### 依赖定义
 
 ```
-# insn32.decode
-%rs2       20:5
-%rs1       15:5
-%rd        7:5
+# Fields（位序在此确定）
+%rs2       20:5                          → Field(pos=20, len=5), mask=0x1f<<20
+%rs1       15:5                          → Field(pos=15, len=5), mask=0x1f<<15
+%rd        7:5                           → Field(pos=7,  len=5), mask=0x1f<<7
+%imm_b     31:s1 7:1 25:6 8:4            → MultiField → FunctionField(ex_shift_1)
+             !function=ex_shift_1
+
+# Argument sets（C 结构体字段名在此确定）
+&r         rd rs1 rs2                    → Arguments(flds=['rd','rs1','rs2'])
+&b         imm rs2 rs1                   → Arguments(flds=['imm','rs2','rs1'])
+
+# Formats
+@r  .......   ..... ..... ... ..... ....... &r                %rs2 %rs1 %rd
+@b  .......   ..... ..... ... ..... ....... &b  imm=%imm_b %rs2 %rs1
 ```
 
-#### 格式（format）——定义位格局
+##### token 序列对照
 
 ```
-# insn32.decode
-@r   .......   ..... ..... ... ..... ....... &r   %rs2 %rs1 %rd
-#    ^funct7  ^rs2  ^rs1  ^f3 ^rd   ^opcode
-#    7-bit    5-bit 5-bit 3bit 5bit 7bit
-```
-
-其中 `.` 代表可变位，固定位直接写数字。格式引用了 `&r` 参数集。
-
-#### 模式（pattern）——把固定位填进去
+@r   .......  .....  .....  ...  .....  .......  &r                 %rs2  %rs1  %rd
+@b   .......  .....  .....  ...  .....  .......  &b   imm=%imm_b  %rs2  %rs1
+     ──────────────── 32 个 . ────────────────   arg_<TYPE>  字段导入区
+           纯位宽计数，不关联字段
 
 ```
-sub   0100000 ..... ..... 000 ..... 0110011 @r
+
+```python
+def struct_name(self):
+    return 'arg_' + self.name
+
+if len(allpatterns) != 0:
+output(i4, 'union {\n')
+for n in sorted(arguments.keys()):
+    f = arguments[n]
+    output(i4, i4, f.struct_name(), ' f_', f.name, ';\n')
+output(i4, '} u;\n\n')
+toppat.output_code(4, False, 0, 0)
+
+def output_decl(self):
+    global translate_scope
+    global translate_prefix
+    output('typedef ', self.base.base.struct_name(),
+           ' arg_', self.name, ';\n')
+    output(translate_scope, 'bool ', translate_prefix, '_', self.name,
+           '(DisasContext *ctx, arg_', self.name, ' *a);\n')
+
+def output_extract(self):
+        output('static void ', self.extract_name(), '(DisasContext *ctx, ',
+               self.base.struct_name(), ' *a, ', insntype, ' insn)\n{\n')
+        self.output_fields(str_indent(4), lambda n: 'a->' + n)
+        output('}\n\n')
+
+def output_def(self):
+        if not self.extern:
+            output('typedef struct {\n')
+            for (n, t) in zip(self.fields, self.types):
+                output(f'    {t} {n};\n')
+            output('} ', self.struct_name(), ';\n\n')
+
+# 'Foo=%Bar' imports a field with a different name.
+if re.fullmatch(re_C_ident + '=' + re_fld_ident, t):
+    (fname, iname) = t.split('=%')
+    flds = add_field_byname(lineno, flds, fname, iname)
+    continue
+
+
+
 ```
 
-#### decodetree.py 自动生成字段提取代码
+##### 逐 token 处理分支
+
+| Token | 匹配规则 | `@r` 动作 | `@b` 动作 |
+|-------|---------|-----------|-----------|
+| `.......` | `[01.-]+`（L1110） | `width += 7` | `width += 7` |
+| `.....` ×4 组 | `[01.-]+` | `width += 5+5+3+5` | `width += 5+5+3+5` |
+| `.......` | `[01.-]+` | `width += 7` → 总计 32 ✓ | `width += 7` → 总计 32 ✓ |
+| `&r` / `&b` | `&[a-zA-Z]...`（L1068） | `arg = arguments['r']` | `arg = arguments['b']` |
+| `imm=%imm_b` | `name=%name`（L1096） | — | **字段重命名**：`flds['imm'] = fields['imm_b']` |
+| `%rs2` | `%[a-zA-Z]...`（L1090） | `flds['rs2'] = fields['rs2']` | `flds['rs2'] = fields['rs2']` |
+| `%rs1` | `%[a-zA-Z]...` | `flds['rs1'] = fields['rs1']` | `flds['rs1'] = fields['rs1']` |
+| `%rd` | `%[a-zA-Z]...` | `flds['rd'] = fields['rd']` | — |
+
+**关键洞察一**：格式模板里的 `.` 只做位宽计数。字段的 bit position 来自 `%field POS:LEN` 定义（通过 `add_field_byname` 查 `fields{}` 全局字典），不从格式模板推导。
+
+**关键洞察二**：`imm=%imm_b` 是字段重命名语法——本地字段名 `imm`（匹配 `&b` 的参数名），实际数据来自全局 `%imm_b` 这个 MultiField+FunctionField 对象。
+
+在这里, `&r %rs2 %rs1 %rd` 意思是：  `rs2, rs1, rd` 在 `..... ..... ... .....` 中，从左到右匹配三个5bits的fields，`&r`是表示使用 `&r`对应的参数集，的那个结构体 
+```c
+typedef struct {
+    int rd; ==> %rd
+    int rs1; ==> %rs1
+    int rs2; ==> %rs2
+} arg_r;
+```
+
+##### Parse 完成后：创建 Format 对象（L1177-1179）
+
+```python
+fmt = Format(name, lineno, arg, fixedbits, fixedmask,
+             undefmask, fieldmask, flds, width)
+formats[name] = fmt
+```
+
+两个 Format 对象的最终状态：
+
+| 属性 | `Format('r')` | `Format('b')` |
+|------|--------------|--------------|
+| `.base` (= arg) | `Arguments(flds=['rd','rs1','rs2'])` | `Arguments(flds=['imm','rs2','rs1'])` |
+| `.fields` | `{'rs2': Field(20,5), 'rs1': Field(15,5), 'rd': Field(7,5)}` | `{'imm': FunctionField(ex_shift_1, MultiField(...)), 'rs2': Field(20,5), 'rs1': Field(15,5)}` |
+| `.width` | 32 | 32 |
+
+---
+
+#### 2.2.3 字段的四种 Python 类
+
+`parse_field`（`decodetree.py:861`）根据 `.decode` 语法产生不同类型的 Field 对象：
+
+| `.decode` 写法 | Python 类 | `str_extract()` 生成 |
+|---------------|-----------|---------------------|
+| `20:5` | `Field(sign=False, pos=20, len=5)` | `extract32(insn, 20, 5)` |
+| `31:s1` | `Field(sign=True, pos=31, len=1)` | `sextract32(insn, 31, 1)` |
+| `25:s7 7:5` | `MultiField([Field(25,s7), Field(7,5)])` | `deposit32(deposit32(...), ...)` |
+| `!function=ex_shift_1` | `FunctionField('ex_shift_1', base)` | `ex_shift_1(ctx, <base.str_extract()>)` |
+
+**MultiField 的 `deposit32` 拼装逻辑**（`decodetree.py:314-325`）：
+
+```python
+# %imm_b: 31:s1 7:1 25:6 8:4 —— 4 段非连续位域
+# subs = [Field(31,s1), Field(7,1), Field(25,6), Field(8,4)]
+# 逆序遍历（reversed），逐段 deposit 到结果中：
+ret = '0'; pos = 0
+for f in reversed(self.subs):          # 8:4 → 25:6 → 7:1 → 31:s1
+    ext = f.str_extract(...)
+    if pos == 0: ret = ext
+    else: ret = f'deposit32({ret}, {pos}, 28, {ext})'
+    pos += f.len
+```
+
+**FunctionField 包裹**（`decodetree.py:378-380`）：
+
+```python
+return f'{self.func}(ctx, {self.base.str_extract(...)})'
+#       ex_shift_1(ctx, <MultiField 的 deposit32 表达式>)
+```
+
+---
+
+#### 2.2.4 C 代码生成
+
+##### Arguments.output_def（L457-463）：`typedef struct`
 
 ```c
-// 对应 @r 格式，自动生成
-static void decode_insn32_extract_r(DisasContext *ctx, arg_r *a, uint32_t insn)
+// &r →                             // &b →
+typedef struct {                    typedef struct {
+    int rd;                             int imm;
+    int rs1;                            int rs2;
+    int rs2;                            int rs1;
+} arg_r;                            } arg_b;
+```
+
+`int` 是默认类型（L960: `t = 'int'`），可覆写为 `imm:i64`。字段名就是 `&arg` 定义中写的 token。
+
+##### Format.output_extract（L541-545）：字段提取辅助函数
+
+遍历 `self.fields`，对每个字段调用 `f.str_extract(lambda n: 'a->' + n)`：
+
+```c
+// @r — 简单字段，直接 extract
+static void decode_extract_r(DisasContext *ctx, arg_r *a, uint32_t insn)
 {
-    a->rd  = extract32(insn, 7, 5);   // %rd
-    a->rs1 = extract32(insn, 15, 5);  // %rs1
-    a->rs2 = extract32(insn, 20, 5);  // %rs2
+    a->rd  = extract32(insn, 7, 5);
+    a->rs1 = extract32(insn, 15, 5);
+    a->rs2 = extract32(insn, 20, 5);
+}
+
+// @b — MultiField 拼装 + FunctionField 包裹
+static void decode_extract_b(DisasContext *ctx, arg_b *a, uint32_t insn)
+{
+    a->imm = ex_shift_1(ctx,
+        deposit32(
+            deposit32(
+                deposit32(
+                    extract32(insn, 8, 4),                  // bits [8:11]
+                    4, 28, extract32(insn, 25, 6)           // bits [25:30]
+                ),
+                10, 22, extract32(insn, 7, 1)               // bit [7]
+            ),
+            11, 21, sextract32(insn, 31, 1)                 // bit [31], signed
+        )
+    );
+    a->rs2 = extract32(insn, 20, 5);
+    a->rs1 = extract32(insn, 15, 5);
+}
+```
+
+##### Pattern.output_code & Tree.output_code：嵌套 switch-case 解码树
+
+Pattern 里的固定位（如 `add 0000000 ..... ..... 000 ..... 0110011 @r`）在 parse_generic 中被解析为 `fixedbits`/`fixedmask`。Format 的字段提取函数被内联调用后，switch 逐级匹配固定位：
+
+```c
+bool decode_insn32(DisasContext *ctx, uint32_t insn) {
+    union { arg_r f_r; arg_b f_b; /* ... */ } u;
+
+    switch (insn & 0x7f) {          // 低 7-bit opcode
+    case 0x33:                       // 0110011 → OP 类
+        decode_insn32_extract_r(ctx, &u.f_r, insn);  // ← 先提取字段
+        switch ((insn >> 12) & 0x7f07f) {
+        case 0x0000000:  if (trans_add(ctx, &u.f_r)) return true; break;
+        case 0x4000000:  if (trans_sub(ctx, &u.f_r)) return true; break;
+        }
+        break;
+    case 0x63:  /* BRANCH */
+        decode_insn32_extract_b(ctx, &u.f_b, insn);
+        switch ((insn >> 12) & 0x7) {
+        case 0x0: if (trans_beq(ctx, &u.f_b)) return true; break;
+        // ...
+        }
+        break;
+    }
+    return false;
 }
 ```
 
 **funct7/funct3/opcode 这些固定位不存变量**——它们在自动生成的 switch-case 树中直接参与匹配。
+
+---
+
+#### 2.2.5 Data Flow 全景图
+
+```
+┌─ Fields 定义 ─────────────────────────────────────────────┐
+│ %rs2 20:5  ──→ Field(pos=20, len=5)                       │
+│ %rs1 15:5  ──→ Field(pos=15, len=5)                       │
+│ %rd  7:5   ──→ Field(pos=7,  len=5)                       │
+│ %imm_b 31:s1 7:1 25:6 8:4 !function=ex_shift_1            │
+│           ──→ MultiField([Field(31,s1),Field(7,1),        │
+│                           Field(25,6), Field(8,4)])        │
+│           ──→ FunctionField('ex_shift_1', ^)               │
+└────────────────────────────────────────────────────────────┘
+         ↑ 位序来自 %field 的行内数字，不是格式模板
+
+┌─ Arg sets ────────────────────────────┐
+│ &r rd rs1 rs2 → Arguments(flds=      │
+│   ['rd','rs1','rs2'], types=['int',  │
+│    'int','int'])                      │
+│ &b imm rs2 rs1 → Arguments(flds=     │
+│   ['imm','rs2','rs1'])               │
+└───────────────────────────────────────┘
+         ↑ struct 字段名来自 &arg 的 token 列表
+
+┌─ Formats（parse_generic 拼装以上两者）─────┐
+│                                               │
+│ @r ....... ..... ..... ... ..... .......      │
+│    └── 32 个 . ───┘ &r %rs2 %rs1 %rd         │
+│    纯宽度计数         │  │     │     │         │
+│                       │  └─────┼─────┘         │
+│                       │   查表 fields{} 字典   │
+│                       │                        │
+│ @b ....... ..... ..... ... ..... .......      │
+│    └── 32 个 . ───┘ &b imm=%imm_b %rs2 %rs1  │
+│                       │    │                    │
+│                       │    └ 字段重命名：       │
+│                       │      local 'imm' ←     │
+│                       │      global '%imm_b'   │
+│                       │                        │
+│             ┌─────────┘                        │
+│             ▼                                  │
+│   Format(name, arg, fields, width=32)          │
+│             │                                  │
+│   ┌─────────┼──────────┐                       │
+│   ▼         ▼          ▼                       │
+│ typedef    extract32()  switch-case 解码树     │
+│ struct {}  deposit32()                        │
+│ arg_*      ex_shift_1()                        │
+└────────────────────────────────────────────────┘
+```
+
+##### 硬编码 vs 可配置
+
+| 产物 | `@r` 示例 | `@b` 示例 | 来源 |
+|------|----------|----------|------|
+| struct 字段名 | `rd`, `rs1`, `rs2` | `imm`, `rs2`, `rs1` | `&argset` 定义 |
+| struct 字段类型 | `int` | `int` | 默认 `int`（可覆写为 `i64` 等） |
+| extract 位序 | `20`, `15`, `7` | `31,s1 7,1 25,6 8,4` | `%field` 定义 |
+| 位宽 | `5`, `5`, `5` | MultiField 各段长度 | `%field` 定义 |
+| `extract32` 函数名 | ✅ 硬编码 | ✅ 硬编码 | `bitop_width` 全局变量 |
+| `deposit32` | 无 | ✅ 硬编码 | MultiField.str_extract 模板 |
+| `ex_shift_1(ctx, ...)` | 无 | 函数名来自 `.decode` | `!function=` 声明 |
+| `decode_extract_r` | ✅ 模板 `_extract_<name>` | `decode_extract_b` | 硬编码命名模板 |
+| `arg_r` | ✅ 模板 `arg_<name>` | `arg_b` | 硬编码命名模板 |
+| `uint32_t insn` | ✅ | ✅ | `insntype` 全局变量 |
+| `DisasContext *ctx` | ✅ | ✅ | 硬编码字符串 |
+| 格式里 `.` 数量 | 32 | 32 | 格式模板（只做宽度校验） |
+
+**一句话总结：格式模板里的 `.` 只做位宽计数；字段的 bit position 来自 `%field POS:LEN` 定义；struct 字段名来自 `&argset` 定义；`extract32`、`deposit32`、命名模板和 C 类型签名是真正硬编码在 Python 里的。**
 
 ### 2.4 Decode 流程
 
@@ -456,5 +733,5 @@ decodetree.process('xlrbr.decode', extra_args: '--static-decode=decode_xlrbr'),
 
 ---
 
-> **版本**: QEMU v11.0.0-578-gac0cc20ad2 (branch: master, commit: ac0cc20ad2fe0b8df2e5d9458e90a095ac711ab1)
-> **时间**: 2026-06-26
+> **版本**: QEMU v10.2.0 (tag: v10.2.0, commit: 698104725e)
+> **时间**: 2026-06-30
