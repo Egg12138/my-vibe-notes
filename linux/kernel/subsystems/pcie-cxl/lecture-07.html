@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecture 07: MSI/MSI-X中断 — PCIe/CXL Playground</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<nav class="top-nav">
+    <div class="nav-brand"><span class="brand-icon">&#x2b22;</span>PCIe/CXL Playground</div>
+    <div class="nav-links">
+        <a href="index.html">Home</a>
+        <span class="nav-sep">|</span>
+        <a href="lecture-01.html">01</a>
+        <a href="lecture-02.html">02</a>
+        <a href="lecture-03.html">03</a>
+        <a href="lecture-04.html">04</a>
+        <a href="lecture-05.html">05</a>
+        <a href="lecture-06.html">06</a>
+        <a href="lecture-07.html">07</a>
+        <a href="lecture-09.html">09</a>
+        <a href="lecture-10.html">10</a>
+    </div>
+</nav>
+<div class="lecture-layout">
+<aside class="sidebar">
+    <h3>本讲内容</h3>
+    <a href="#principle" class="toc-item">原理</a>
+    <a href="#guide" class="toc-item">实验指导</a>
+    <div class="exp-list">
+        <h3>全部实验</h3>
+        <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
+        <a href="lecture-02.html" class="exp-link">02 传统PCI设备</a>
+        <a href="lecture-03.html" class="exp-link">03 Root Port与端点</a>
+        <a href="lecture-04.html" class="exp-link">04 配置空间头部</a>
+        <a href="lecture-05.html" class="exp-link">05 BAR与资源分配</a>
+        <a href="lecture-06.html" class="exp-link">06 驱动匹配与绑定</a>
+        <a href="lecture-07.html" class="exp-link current">07 MSI/MSI-X中断</a>
+        <a href="lecture-09.html" class="exp-link">09 CXL拓扑</a>
+        <a href="lecture-10.html" class="exp-link">10 CXL解码器与区域</a>
+    </div>
+</aside>
+<main class="lecture-main">
+
+<h1>实验 07: MSI/MSI-X 中断</h1>
+<p class="lecture-meta">Part 1 · PCI Express 基础 · 能力链表与中断机制</p>
+
+<section id="principle">
+<h2>原理</h2>
+
+<h3>PCI 能力链表</h3>
+<p>PCI 设备通过配置空间中的<strong>能力链表 (Capability Linked List)</strong> 来通告可选功能。链表从偏移 0x34 开始（Type 0 header 的 Capabilities Pointer）。每个能力条目有两个标准字节：</p>
+
+<table>
+    <tr><th>偏移</th><th>大小</th><th>字段</th></tr>
+    <tr><td>+0</td><td>1</td><td>Capability ID（标识能力类型）</td></tr>
+    <tr><td>+1</td><td>1</td><td>Next Pointer（下一个能力的偏移，0x00 = 链表结束）</td></tr>
+    <tr><td>+2</td><td>变长</td><td>能力特定的寄存器</td></tr>
+</table>
+
+<p>常见 PCIe Capability ID：</p>
+<table>
+    <tr><th>ID</th><th>能力</th></tr>
+    <tr><td>0x01</td><td>PM (Power Management)</td></tr>
+    <tr><td>0x05</td><td>MSI</td></tr>
+    <tr><td>0x10</td><td>PCI Express</td></tr>
+    <tr><td>0x11</td><td>MSI-X</td></tr>
+</table>
+
+<h3>MSI-X 能力结构</h3>
+<p>MSI-X 是 PCIe 设备的主要中断机制。它的能力条目结构如下：</p>
+
+<div class="ascii-diagram">
+     MSI-X Capability 结构（12 字节）：
+
+     Offset  +0   +1   +2   +3   +4   +5   +6   +7   +8   +9  +10  +11
+            ┌────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┬────┐
+            │ ID │Next│  Message Control │ Table Offset / BIR│ PBA Offset/BIR│
+            └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
+             0x11
+                    ├──bits 0-10──┤├15┤├bit 2:0──┤├─bits 31:3──┤
+                       Table Size   En  BAR index   Qword offset
+</div>
+
+<ul>
+    <li><strong>Table Size</strong>：MSI-X 向量数 - 1（例如值 3 = 4 个向量）</li>
+    <li><strong>Enable (bit 15)</strong>：1 = MSI-X 已启用</li>
+    <li><strong>Table BIR (bits 2:0)</strong>：MSI-X 表所在的 BAR 编号（0-5）</li>
+    <li><strong>Table Offset (bits 31:3)</strong>：该 BAR 内 MSI-X 表的 qword 偏移（8 字节对齐）</li>
+</ul>
+
+<h3>中断与驱动生命周期</h3>
+<p>中断是驱动绑定后才分配的资源。驱动 detach 时，MSI-X 向量被释放，<code>/proc/interrupts</code> 中的条目消失。这与实验 06 的观察一致：设备存活，但中断资源跟随驱动。</p>
+</section>
+
+<section id="guide">
+<h2>实验指导</h2>
+
+<h3>目标</h3>
+<p>遍历 PCI 能力链表，解码 MSI-X 能力结构，观察驱动解绑/重绑定对 /proc/interrupts 中中断条目的影响。</p>
+
+<h3>操作步骤</h3>
+
+<ol>
+    <li><strong>运行自动观察：</strong>
+        <pre><code>make verify-07</code></pre>
+    </li>
+    <li><strong>交互式探索：</strong>
+        <pre><code>make run-07</code></pre>
+        在 guest shell 中：
+        <pre><code># 找到端点中断
+cat /sys/bus/pci/devices/0000:01:00.0/irq
+grep PCI-MSI /proc/interrupts
+
+# 查看能力链表
+od -An -tu1 -j 52 -N 1 /sys/bus/pci/devices/0000:01:00.0/config
+# 第一个值是能力指针
+
+# 解绑看中断消失
+echo "0000:01:00.0" > /sys/bus/pci/drivers/virtio-pci/unbind
+grep PCI-MSI /proc/interrupts
+
+# 重新绑定看中断恢复
+echo "0000:01:00.0" > /sys/bus/pci/drivers/virtio-pci/bind
+grep PCI-MSI /proc/interrupts</code></pre>
+    </li>
+</ol>
+
+<h3>预期观察</h3>
+<ul>
+    <li>能力链表中包含：PM (0x01)、MSI (0x05)、PCIe (0x10)、<strong>MSI-X (0x11)</strong>、Vendor-Specific (0x09)</li>
+    <li>MSI-X：Table Size = 某值（QEMU virtio-rng 有多个向量），Enable = 1</li>
+    <li>/proc/interrupts 中有 <code>PCI-MSIX-0000:01:00.0</code> 条目</li>
+    <li>解绑后：MSI-X 条目消失</li>
+    <li>重新绑定后：MSI-X 条目恢复（IRQ 号可能改变）</li>
+</ul>
+
+<h3>解释</h3>
+<p>能力链表是 PCIe 扩展性的核心机制——通过一个简单的链表遍历，OS 可以发现设备支持的所有可选功能。MSI-X 是 MSI 的增强版，支持更多向量（最多 2048 个）和独立于 MSI 的地址/数据配置。IRQ 资源与驱动绑定生命周期强耦合，这是实验 06 "枚举 ≠ 绑定" 的进一步验证。</p>
+
+<div class="callout callout-tip">
+    <strong>提示：</strong>这个实验使用 BusyBox 的 <code>od</code> 逐字节解码结构体。如果你在真实 Linux 上，可以用 <code>lspci -vv</code> 直接看到解码后的能力链表——但手动解码过程能帮助你理解寄存器布局。
+</div>
+</section>
+
+<div class="bottom-nav">
+    <a class="prev" href="lecture-06.html">实验 06: 驱动匹配与绑定</a>
+    <a class="next" href="lecture-09.html">实验 09: CXL拓扑</a>
+</div>
+
+</main>
+</div>
+<footer class="site-footer">
+    <p>PCIe/CXL Playground &mdash; Built for understanding, not for production.</p>
+</footer>
+</body>
+</html>

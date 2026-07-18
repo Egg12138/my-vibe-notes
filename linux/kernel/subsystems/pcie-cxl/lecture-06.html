@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecture 06: 驱动匹配与绑定 — PCIe/CXL Playground</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<nav class="top-nav">
+    <div class="nav-brand"><span class="brand-icon">&#x2b22;</span>PCIe/CXL Playground</div>
+    <div class="nav-links">
+        <a href="index.html">Home</a>
+        <span class="nav-sep">|</span>
+        <a href="lecture-01.html">01</a>
+        <a href="lecture-02.html">02</a>
+        <a href="lecture-03.html">03</a>
+        <a href="lecture-04.html">04</a>
+        <a href="lecture-05.html">05</a>
+        <a href="lecture-06.html">06</a>
+        <a href="lecture-07.html">07</a>
+        <a href="lecture-09.html">09</a>
+        <a href="lecture-10.html">10</a>
+    </div>
+</nav>
+<div class="lecture-layout">
+<aside class="sidebar">
+    <h3>本讲内容</h3>
+    <a href="#principle" class="toc-item">原理</a>
+    <a href="#guide" class="toc-item">实验指导</a>
+    <div class="exp-list">
+        <h3>全部实验</h3>
+        <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
+        <a href="lecture-02.html" class="exp-link">02 传统PCI设备</a>
+        <a href="lecture-03.html" class="exp-link">03 Root Port与端点</a>
+        <a href="lecture-04.html" class="exp-link">04 配置空间头部</a>
+        <a href="lecture-05.html" class="exp-link">05 BAR与资源分配</a>
+        <a href="lecture-06.html" class="exp-link current">06 驱动匹配与绑定</a>
+        <a href="lecture-07.html" class="exp-link">07 MSI/MSI-X中断</a>
+        <a href="lecture-09.html" class="exp-link">09 CXL拓扑</a>
+        <a href="lecture-10.html" class="exp-link">10 CXL解码器与区域</a>
+    </div>
+</aside>
+<main class="lecture-main">
+
+<h1>实验 06: 驱动匹配与绑定</h1>
+<p class="lecture-meta">Part 1 · PCI Express 基础 · 枚举与绑定的解耦</p>
+
+<section id="principle">
+<h2>原理</h2>
+
+<h3>两条独立的路径</h3>
+<p>Linux PCI 子系统中，<strong>枚举</strong>和<strong>驱动绑定</strong>是两个完全分离的阶段：</p>
+
+<ol>
+    <li><strong>枚举</strong>：PCI 核心扫描总线，发现 Vendor ID ≠ 0xFFFF 时创建 <code>struct pci_dev</code>。设备存在完全由<strong>硬件存在性</strong>决定。</li>
+    <li><strong>驱动绑定</strong>：驱动注册时，PCI 核心将驱动的 <code>id_table</code>（vendor:device 匹配表）与每个未绑定设备比较。匹配成功 → 调用驱动的 <code>probe()</code> → 建立绑定。</li>
+</ol>
+
+<div class="ascii-diagram">
+     枚举（硬件驱动）              绑定（软件驱动）
+     ────────────────              ────────────────
+     Bus scan                      driver_register()
+        │                              │
+        ▼                              ▼
+     pci_dev 创建                  match id_table
+        │                              │
+        ▼                              ▼
+     sysfs 目录                    probe() 成功
+        │                              │
+        ▼                              ▼
+     /sys/bus/pci/                 driver 符号链接
+     devices/0000:01:00.0/         DRIVER= in uevent
+        │                              │
+        │                              ▼
+        └──────────── 等待驱动 ──────→ bind
+</div>
+
+<h3>Match Key: modalias</h3>
+<p>每个 PCI 设备的 <code>modalias</code> 文件包含完整的匹配键：</p>
+<pre><code>pci:v00001AF4d00001044sv00001AF4sd00001100bc00scFFi00</code></pre>
+<p>每个字段：<code>v</code>=vendor, <code>d</code>=device, <code>sv</code>=subsystem vendor, <code>sd</code>=subsystem device, <code>bc</code>=base class, <code>sc</code>=sub class。驱动在 <code>struct pci_device_id</code> 表中声明支持的 vendor/device 组合。</p>
+
+<h3>sysfs 绑定接口</h3>
+<p>每个 PCI 驱动的 sysfs 目录下有 <code>bind</code> 和 <code>unbind</code> 文件，允许用户空间手动控制绑定状态：</p>
+<pre><code>/sys/bus/pci/drivers/virtio-pci/
+├── bind      ← 写入 BDF 来绑定设备
+├── unbind    ← 写入 BDF 来解绑设备
+└── 0000:01:00.0 → 当前绑定的设备符号链接</code></pre>
+</section>
+
+<section id="guide">
+<h2>实验指导</h2>
+
+<h3>目标</h3>
+<p>通过 sysfs 的 unbind/bind 操作，证明 PCI 设备目录在解绑后仍然存在，而 driver 符号链接和 uevent 中的 DRIVER= 行会消失和恢复。</p>
+
+<h3>操作步骤</h3>
+
+<ol>
+    <li><strong>运行自动观察：</strong>
+        <pre><code>make verify-06</code></pre>
+    </li>
+    <li><strong>交互式探索：</strong>
+        <pre><code>make run-06</code></pre>
+        在 guest shell 中：
+        <pre><code># 查看初始状态
+cat /sys/bus/pci/devices/0000:01:00.0/modalias
+readlink /sys/bus/pci/devices/0000:01:00.0/driver
+grep DRIVER= /sys/bus/pci/devices/0000:01:00.0/uevent
+
+# 解绑
+echo "0000:01:00.0" > /sys/bus/pci/drivers/virtio-pci/unbind
+
+# 观察解绑后的状态
+ls /sys/bus/pci/devices/0000:01:00.0/driver   # 应该不存在
+grep DRIVER= /sys/bus/pci/devices/0000:01:00.0/uevent  # 应该没有
+
+# 重新绑定
+echo "0000:01:00.0" > /sys/bus/pci/drivers/virtio-pci/bind</code></pre>
+    </li>
+</ol>
+
+<h3>预期观察</h3>
+<ul>
+    <li>解绑后：<strong>设备目录仍然存在</strong>（证明设备由枚举维护，不是由驱动维护）</li>
+    <li>解绑后：<code>driver</code> 符号链接消失，<code>uevent</code> 中 <code>DRIVER=</code> 行消失</li>
+    <li>重新绑定后：driver 符号链接和 DRIVER= 行均恢复</li>
+</ul>
+
+<h3>解释</h3>
+<p>PCI 设备是<strong>总线资源</strong>，由 PCI 核心管理其生命周期。驱动是可选的<strong>消费者</strong>。设备不需要驱动也能存在于 sysfs 中并暴露完整的配置空间。这种解耦在热插拔和虚拟化场景中非常关键——可以安全地解绑旧驱动、绑定新驱动，而不影响设备在总线上的存在。</p>
+
+<div class="callout callout-warn">
+    <strong>实验后恢复：</strong>在 <code>make verify</code> 模式下，init 脚本会自动执行 unbind → bind 并验证恢复。如果你在交互式 shell 中解绑了 virtio-rng，记得重新绑定，否则下一个实验（MSI-X）将看不到 IRQ。
+</div>
+</section>
+
+<div class="bottom-nav">
+    <a class="prev" href="lecture-05.html">实验 05: BAR与资源分配</a>
+    <a class="next" href="lecture-07.html">实验 07: MSI/MSI-X中断</a>
+</div>
+
+</main>
+</div>
+<footer class="site-footer">
+    <p>PCIe/CXL Playground &mdash; Built for understanding, not for production.</p>
+</footer>
+</body>
+</html>

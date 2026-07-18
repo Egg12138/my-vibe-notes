@@ -1,0 +1,140 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecture 05: BAR与资源分配 — PCIe/CXL Playground</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<nav class="top-nav">
+    <div class="nav-brand"><span class="brand-icon">&#x2b22;</span>PCIe/CXL Playground</div>
+    <div class="nav-links">
+        <a href="index.html">Home</a>
+        <span class="nav-sep">|</span>
+        <a href="lecture-01.html">01</a>
+        <a href="lecture-02.html">02</a>
+        <a href="lecture-03.html">03</a>
+        <a href="lecture-04.html">04</a>
+        <a href="lecture-05.html">05</a>
+        <a href="lecture-06.html">06</a>
+        <a href="lecture-07.html">07</a>
+        <a href="lecture-09.html">09</a>
+        <a href="lecture-10.html">10</a>
+    </div>
+</nav>
+<div class="lecture-layout">
+<aside class="sidebar">
+    <h3>本讲内容</h3>
+    <a href="#principle" class="toc-item">原理</a>
+    <a href="#guide" class="toc-item">实验指导</a>
+    <div class="exp-list">
+        <h3>全部实验</h3>
+        <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
+        <a href="lecture-02.html" class="exp-link">02 传统PCI设备</a>
+        <a href="lecture-03.html" class="exp-link">03 Root Port与端点</a>
+        <a href="lecture-04.html" class="exp-link">04 配置空间头部</a>
+        <a href="lecture-05.html" class="exp-link current">05 BAR与资源分配</a>
+        <a href="lecture-06.html" class="exp-link">06 驱动匹配与绑定</a>
+        <a href="lecture-07.html" class="exp-link">07 MSI/MSI-X中断</a>
+        <a href="lecture-09.html" class="exp-link">09 CXL拓扑</a>
+        <a href="lecture-10.html" class="exp-link">10 CXL解码器与区域</a>
+    </div>
+</aside>
+<main class="lecture-main">
+
+<h1>实验 05: BAR 与资源分配</h1>
+<p class="lecture-meta">Part 1 · PCI Express 基础 · 从配置寄存器到系统内存映射</p>
+
+<section id="principle">
+<h2>原理</h2>
+
+<h3>BAR 是什么</h3>
+<p><strong>BAR (Base Address Register)</strong> 是 PCI 配置空间中偏移 0x10–0x24 的 6 个 32-bit 寄存器。它们告诉 BIOS/OS：设备需要什么类型的内存或 I/O 空间、需要多大、以及这些空间应该映射到物理地址空间的什么位置。</p>
+
+<h3>BAR 的编码方式</h3>
+<p>BAR 的低位是<strong>只读属性位</strong>，不是地址的一部分：</p>
+
+<table>
+    <tr><th>Bit</th><th>含义</th></tr>
+    <tr><td>0</td><td>0 = Memory Space, 1 = I/O Space</td></tr>
+    <tr><td>2-1</td><td>Memory BAR：00=32-bit, 10=64-bit<br>I/O BAR：保留</td></tr>
+    <tr><td>3</td><td>Memory BAR：Prefetchable（可预取）</td></tr>
+    <tr><td>31-4</td><td><strong>基地址</strong>（4KB 对齐）</td></tr>
+</table>
+
+<p>要得到基地址，需要 mask 掉低 4 位：<code>base = raw_bar & ~0xf</code>。</p>
+
+<h3>地址空间层级</h3>
+<p>Linux 的资源分配遵循桥窗口嵌套原则：</p>
+
+<div class="ascii-diagram">
+     /proc/iomem（简化）：
+
+     fe600000-fe7fffff : PCI Bus 0000:01        ← Root Port 的 MMIO 桥窗口
+       fe600000-fe600fff : 0000:01:00.0          ← 端点 BAR1（嵌套在桥窗口内）
+     fea00000-febfffff : PCI Bus 0000:01        ← Root Port 的预取窗口
+       fea00000-fea03fff : 0000:01:00.0          ← 端点 BAR4/5（64-bit 预取）
+</div>
+
+<p>桥窗口<strong>包含</strong>其下级设备的所有 MMIO 范围。CPU 访问落在窗口内的地址时，桥将事务转发到其下级总线。</p>
+
+<h3>Bar Sizing 机制</h3>
+<p>BAR 的大小通过写全 1 再读回来确定：<code>size = ~(read_back_after_write_all_ones & ~0xf) + 1</code>。但本实验不执行 BAR sizing（会破坏性地修改 BAR 值），而是通过 Linux 的 <code>resource</code> 文件间接获取 size。</p>
+</section>
+
+<section id="guide">
+<h2>实验指导</h2>
+
+<h3>目标</h3>
+<p>解码三种典型 BAR（32-bit 非预取 × 2 + 64-bit 预取），验证 BAR 基地址与 Linux resource 分配一致，观察 /proc/iomem 桥窗口嵌套。</p>
+
+<h3>操作步骤</h3>
+
+<ol>
+    <li><strong>运行自动观察：</strong>
+        <pre><code>make verify-05</code></pre>
+    </li>
+    <li><strong>交互式探索：</strong>
+        <pre><code>make run-05</code></pre>
+        在 guest shell 中：
+        <pre><code># 读 Root Port BAR0（偏移 0x10）
+od -An -tu4 -j 16 -N 4 /sys/bus/pci/devices/0000:00:01.0/config
+
+# 读对应的 resource
+cat /sys/bus/pci/devices/0000:00:01.0/resource
+
+# 看 MMIO 空间布局
+grep -E "fe[678a]" /proc/iomem</code></pre>
+    </li>
+</ol>
+
+<h3>预期观察</h3>
+<ul>
+    <li>Root Port BAR0 raw = 0xfe800000 → 低 4 位全 0 → 32-bit 非预取 memory BAR → base = 0xfe800000</li>
+    <li>resource[0] = 0xfe800000–0xfe800fff，size = 0x1000（4KB）</li>
+    <li>端点 BAR1 raw = 0xfe600000 → 同类型 → base = 0xfe600000</li>
+    <li>端点 BAR4 raw = 0xfea0000<strong>c</strong> → 低 4 位 = 0xc (1100) → 64-bit 预取 → 结合 BAR5 得 base = 0xfea00000</li>
+    <li>/proc/iomem 中端点范围嵌套在 Bus 0000:01 的桥窗口内</li>
+</ul>
+
+<h3>解释</h3>
+<p>BAR 的低 4 位是属性（类型、宽度、预取性），mask 后得到基地址。这个基地址由平台固件或 OS 在枚举时<strong>分配</strong>，不是设备固化的。Linux 通过 sysfs 的 resource 文件暴露分配结果。桥窗口包含下级设备的所有 BAR 范围，形成<strong>层级化的 MMIO 地址空间</strong>。</p>
+
+<div class="callout callout-info">
+    <strong>64-bit BAR 特殊处理：</strong>64-bit BAR 占用连续的两个 32-bit BAR 槽位（如 BAR4+BAR5）。写操作必须同时更新两个 32-bit 寄存器以确保原子性。BAR4 的低 4 位仍是属性位，BAR5 的所有 32 位都是地址的高位部分。
+</div>
+</section>
+
+<div class="bottom-nav">
+    <a class="prev" href="lecture-04.html">实验 04: 配置空间头部</a>
+    <a class="next" href="lecture-06.html">实验 06: 驱动匹配与绑定</a>
+</div>
+
+</main>
+</div>
+<footer class="site-footer">
+    <p>PCIe/CXL Playground &mdash; Built for understanding, not for production.</p>
+</footer>
+</body>
+</html>

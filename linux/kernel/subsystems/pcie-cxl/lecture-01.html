@@ -1,0 +1,143 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecture 01: WSL2 vs QEMU — PCIe/CXL Playground</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<nav class="top-nav">
+    <div class="nav-brand"><span class="brand-icon">&#x2b22;</span>PCIe/CXL Playground</div>
+    <div class="nav-links">
+        <a href="index.html">Home</a>
+        <span class="nav-sep">|</span>
+        <a href="lecture-01.html">01</a>
+        <a href="lecture-02.html">02</a>
+        <a href="lecture-03.html">03</a>
+        <a href="lecture-04.html">04</a>
+        <a href="lecture-05.html">05</a>
+        <a href="lecture-06.html">06</a>
+        <a href="lecture-07.html">07</a>
+        <a href="lecture-09.html">09</a>
+        <a href="lecture-10.html">10</a>
+    </div>
+</nav>
+<div class="lecture-layout">
+<aside class="sidebar">
+    <h3>本讲内容</h3>
+    <a href="#principle" class="toc-item">原理</a>
+    <a href="#guide" class="toc-item">实验指导</a>
+    <div class="exp-list">
+        <h3>全部实验</h3>
+        <a href="lecture-01.html" class="exp-link current">01 WSL2 vs QEMU</a>
+        <a href="lecture-02.html" class="exp-link">02 传统PCI设备</a>
+        <a href="lecture-03.html" class="exp-link">03 Root Port与端点</a>
+        <a href="lecture-04.html" class="exp-link">04 配置空间头部</a>
+        <a href="lecture-05.html" class="exp-link">05 BAR与资源分配</a>
+        <a href="lecture-06.html" class="exp-link">06 驱动匹配与绑定</a>
+        <a href="lecture-07.html" class="exp-link">07 MSI/MSI-X中断</a>
+        <a href="lecture-09.html" class="exp-link">09 CXL拓扑</a>
+        <a href="lecture-10.html" class="exp-link">10 CXL解码器与区域</a>
+    </div>
+</aside>
+<main class="lecture-main">
+
+<h1>实验 01: WSL2 vs QEMU 环境对比</h1>
+<p class="lecture-meta">Part 1 · PCI Express 基础 · 建立虚拟化环境认知</p>
+
+<section id="principle">
+<h2>原理</h2>
+
+<h3>虚拟化 PCI 总线</h3>
+<p>当你在运行 Linux 时，<code>lspci</code> 列出的设备从哪里来？答案取决于你运行 Linux 的<strong>环境</strong>：</p>
+<ul>
+    <li><strong>物理机</strong>：固件（BIOS/UEFI）扫描硬件 PCI 总线，通过 ACPI 表将拓扑报告给操作系统</li>
+    <li><strong>WSL2</strong>：微软虚拟化层合成了一套虚拟 PCI 设备，<strong>不暴露宿主机 Windows 的物理 PCIe 拓扑</strong></li>
+    <li><strong>QEMU</strong>：QEMU 模拟了完整的 q35 芯片组，设备列表完全由 QEMU 命令行决定，可重现、可控</li>
+</ul>
+
+<div class="callout callout-info">
+    <strong>关键认知：</strong>虚拟化环境中的 PCI 设备是<strong>由虚拟化层合成</strong>的，不是直通硬件。理解这一点是后续所有实验的基础。
+</div>
+
+<h3>QEMU q35 机器模型</h3>
+<p>QEMU 的 <code>q35</code> 机器类型模拟了 Intel Q35 芯片组。即使不加任何 <code>-device</code> 参数，它也会自动创建最少 4 个板载设备：</p>
+
+<table>
+    <tr><th>BDF</th><th>Class</th><th>描述</th></tr>
+    <tr><td>00:00.0</td><td>0600</td><td>Host Bridge（主桥）</td></tr>
+    <tr><td>00:1f.0</td><td>0601</td><td>ISA Bridge（ISA 桥）</td></tr>
+    <tr><td>00:1f.2</td><td>0106</td><td>SATA Controller（SATA 控制器）</td></tr>
+    <tr><td>00:1f.3</td><td>0c05</td><td>SMBus Controller（SMBus 控制器）</td></tr>
+</table>
+
+<p>每次启动 QEMU，这 4 个设备都会出现在相同的 BDF 地址上。这种<strong>确定性</strong>是教学环境的核心优势。</p>
+
+<div class="ascii-diagram">
+                     WSL2                           QEMU q35
+              ┌─────────────────┐           ┌─────────────────┐
+              │  lspci 看到的    │           │  lspci 看到的    │
+              │  合成 PCI 设备   │           │  4 个 q35 芯片组  │
+              │                 │           │  + 可添加的设备   │
+              └────────┬────────┘           └────────┬────────┘
+                       │                             │
+              ┌────────┴────────┐           ┌────────┴────────┐
+              │  WSL2 虚拟化层   │           │  QEMU TCG 模拟   │
+              └────────┬────────┘           └────────┬────────┘
+                       │                             │
+              ┌────────┴────────┐           ┌────────┴────────┐
+              │  Windows 物理   │           │  Linux 宿主机    │
+              │  PCIe 拓扑      │           │  (不可见)        │
+              └─────────────────┘           └─────────────────┘
+              ^     宿主机物理硬件不可见      ^     模拟硬件，非直通
+</div>
+</section>
+
+<section id="guide">
+<h2>实验指导</h2>
+
+<h3>目标</h3>
+<p>对比 WSL2 和 QEMU 环境中 <code>lspci</code> 的输出，理解虚拟化 PCI 环境的基本特征。</p>
+
+<h3>操作步骤</h3>
+
+<ol>
+    <li><strong>记录宿主机（WSL2）的 PCI 设备：</strong>
+        <pre><code>make host</code></pre>
+        输出保存在 <code>build/host-lspci.txt</code>。
+    </li>
+    <li><strong>启动 QEMU guest 并自动观察：</strong>
+        <pre><code>make verify</code></pre>
+        输出保存在 <code>build/qemu-serial.log</code>。
+    </li>
+    <li><strong>比较两个文件</strong>中的设备列表——BDF 地址、vendor:device ID 和 class 都不同。</li>
+    <li><strong>（可选）交互式探索：</strong>
+        <pre><code>make run</code></pre>
+        在 guest shell 中运行 <code>lspci -nn</code> 和 <code>ls /sys/bus/pci/devices/</code>。
+    </li>
+</ol>
+
+<h3>预期观察</h3>
+<p>WSL2 的 <code>lspci</code> 输出包含微软 Hyper-V 合成设备。QEMU guest 的 <code>lspci</code> 始终显示固定的 4 个 ICH9 芯片组功能。两者<strong>都不显示宿主机的真实物理 PCIe 拓扑</strong>。</p>
+
+<h3>解释</h3>
+<p>PCI 枚举在虚拟化环境中被截获。WSL2 和 QEMU 都向 guest OS 呈现一个合成的 PCI 总线视图。这意味着我们需要 QEMU 来创建<strong>可控的、可重现的</strong> PCIe 拓扑用于教学。</p>
+
+<div class="callout callout-tip">
+    <strong>提示：</strong>如果卡住了，思考这个问题：QEMU 和 WSL2 哪一个让你能精确控制 PCI 设备的数量和类型？为什么这对学习很重要？
+</div>
+</section>
+
+<div class="bottom-nav">
+    <span></span>
+    <a class="next" href="lecture-02.html">实验 02: 添加传统PCI设备</a>
+</div>
+
+</main>
+</div>
+<footer class="site-footer">
+    <p>PCIe/CXL Playground &mdash; Built for understanding, not for production.</p>
+</footer>
+</body>
+</html>

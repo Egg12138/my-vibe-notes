@@ -1,0 +1,124 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PCIe/CXL Playground — 教学课件</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<nav class="top-nav">
+    <div class="nav-brand">
+        <span class="brand-icon">&#x2b22;</span>
+        PCIe/CXL Playground
+    </div>
+    <div class="nav-links">
+        <a href="https://github.com" target="_blank">Repo</a>
+    </div>
+</nav>
+
+<header class="hero">
+    <h1>PCIe &amp; CXL 教学课件</h1>
+    <p class="subtitle">通过 9 个实验，从 PCI 枚举到 CXL 内存语义，逐层理解现代 I/O 协议栈</p>
+    <div class="badge-row">
+        <span class="badge">QEMU q35</span>
+        <span class="badge">Linux Kernel</span>
+        <span class="badge">BusyBox initramfs</span>
+        <span class="badge">sysfs</span>
+        <span class="badge">配置空间</span>
+        <span class="badge">CXL 2.0</span>
+    </div>
+</header>
+
+<main class="container">
+
+    <div class="section-header">
+        <h2>Part 1: PCI Express 基础</h2>
+        <span class="section-count">实验 01 – 07</span>
+    </div>
+
+    <div class="card-grid">
+
+        <div class="card">
+            <div class="card-num">Experiment 01</div>
+            <a href="lecture-01.html"><div class="card-title">WSL2 vs QEMU 环境对比</div></a>
+            <div class="card-desc">比较 WSL2 和 QEMU 虚拟化环境中的 PCI 设备视图，建立"虚拟 PCI 对象 vs 物理拓扑"的基本认知。</div>
+            <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-num">Experiment 02</div>
+            <a href="lecture-02.html"><div class="card-title">添加一个传统 PCI 设备</div></a>
+            <div class="card-desc">在 QEMU q35 拓扑中添加 pci-testdev，观察 Linux 枚举如何发现新 BDF 并通过 sysfs 暴露设备身份。</div>
+            <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-num">Experiment 03</div>
+            <a href="lecture-03.html"><div class="card-title">PCIe Root Port 与端点</div></a>
+            <div class="card-desc">引入 Root Port 桥和端点设备，学习 PCIe 拓扑层级、总线编号空间和 sysfs 父子路径。</div>
+            <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-num">Experiment 04</div>
+            <a href="lecture-04.html"><div class="card-title">配置空间头部解析</div></a>
+            <div class="card-desc">直接读取 PCI 配置空间前 64 字节，解码 vendor/device ID、class code、header type 和总线编号字段。</div>
+            <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-num">Experiment 05</div>
+            <a href="lecture-05.html"><div class="card-title">BAR 与资源分配</div></a>
+            <div class="card-desc">解码 BAR 寄存器的地址类型和基地址，验证其与 Linux resource 分配的一致性，观察 /proc/iomem 桥窗口嵌套。</div>
+            <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-num">Experiment 06</div>
+            <a href="lecture-06.html"><div class="card-title">驱动匹配与绑定</div></a>
+            <div class="card-desc">通过 sysfs 的 unbind/bind 操作，证明 PCI 枚举和驱动绑定是独立阶段，设备生命周期长于驱动绑定周期。</div>
+            <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-num">Experiment 07</div>
+            <a href="lecture-07.html"><div class="card-title">MSI/MSI-X 中断</div></a>
+            <div class="card-desc">遍历 PCI 能力链表，解码 MSI-X capability 结构，观察驱动解绑/重绑定对 /proc/interrupts 中中断条目的影响。</div>
+            <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
+        </div>
+
+    </div>
+
+    <div class="section-header">
+        <h2>Part 2: CXL 内存语义</h2>
+        <span class="section-count">实验 09 – 10</span>
+    </div>
+
+    <div class="card-grid">
+
+        <div class="card">
+            <div class="card-num">Experiment 09</div>
+            <a href="lecture-09.html"><div class="card-title">CXL 拓扑：Host Bridge, Root Port 与 Type 3 设备</div></a>
+            <div class="card-desc">构建最小 CXL 拓扑（pxb-cxl + cxl-rp + cxl-type3），观察 CXL 设备如何复用 PCIe 枚举和配置空间，并引入 /sys/bus/cxl/ 总线。</div>
+            <div class="card-tags"><span class="card-tag tag-cxl">CXL</span><span class="card-tag tag-both">PCIe + CXL</span></div>
+        </div>
+
+        <div class="card">
+            <div class="card-num">Experiment 10</div>
+            <a href="lecture-10.html"><div class="card-title">CXL 解码器、内存设备与区域</div></a>
+            <div class="card-desc">深入 HDM 解码器层级（root → port → endpoint），理解 CFMW、解码器编程状态和 CXL region 的关系，揭示枚举 ≠ 编程的核心认知。</div>
+            <div class="card-tags"><span class="card-tag tag-cxl">CXL</span></div>
+        </div>
+
+    </div>
+
+</main>
+
+<footer class="site-footer">
+    <p>PCIe/CXL Playground &mdash; Built for understanding, not for production. &copy; 2026</p>
+</footer>
+
+</body>
+</html>

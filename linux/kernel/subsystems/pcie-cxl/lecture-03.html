@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecture 03: PCIe Root Port与端点 — PCIe/CXL Playground</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<nav class="top-nav">
+    <div class="nav-brand"><span class="brand-icon">&#x2b22;</span>PCIe/CXL Playground</div>
+    <div class="nav-links">
+        <a href="index.html">Home</a>
+        <span class="nav-sep">|</span>
+        <a href="lecture-01.html">01</a>
+        <a href="lecture-02.html">02</a>
+        <a href="lecture-03.html">03</a>
+        <a href="lecture-04.html">04</a>
+        <a href="lecture-05.html">05</a>
+        <a href="lecture-06.html">06</a>
+        <a href="lecture-07.html">07</a>
+        <a href="lecture-09.html">09</a>
+        <a href="lecture-10.html">10</a>
+    </div>
+</nav>
+<div class="lecture-layout">
+<aside class="sidebar">
+    <h3>本讲内容</h3>
+    <a href="#principle" class="toc-item">原理</a>
+    <a href="#guide" class="toc-item">实验指导</a>
+    <div class="exp-list">
+        <h3>全部实验</h3>
+        <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
+        <a href="lecture-02.html" class="exp-link">02 传统PCI设备</a>
+        <a href="lecture-03.html" class="exp-link current">03 Root Port与端点</a>
+        <a href="lecture-04.html" class="exp-link">04 配置空间头部</a>
+        <a href="lecture-05.html" class="exp-link">05 BAR与资源分配</a>
+        <a href="lecture-06.html" class="exp-link">06 驱动匹配与绑定</a>
+        <a href="lecture-07.html" class="exp-link">07 MSI/MSI-X中断</a>
+        <a href="lecture-09.html" class="exp-link">09 CXL拓扑</a>
+        <a href="lecture-10.html" class="exp-link">10 CXL解码器与区域</a>
+    </div>
+</aside>
+<main class="lecture-main">
+
+<h1>实验 03: PCIe Root Port 与端点</h1>
+<p class="lecture-meta">Part 1 · PCI Express 基础 · 拓扑层级与总线编号</p>
+
+<section id="principle">
+<h2>原理</h2>
+
+<h3>PCIe 拓扑 vs 传统 PCI 拓扑</h3>
+<p>传统 PCI 是共享总线：所有设备挂在同一条总线上，通过电气信号仲裁访问。PCIe 是<strong>点对点</strong>链路：每个设备通过独立的链路连接到上游。这意味着 PCIe 拓扑本质上是一棵<strong>树</strong>。</p>
+
+<p>树的节点类型：</p>
+<ul>
+    <li><strong>Root Complex (RC)</strong>：树的根，连接 CPU 和 PCIe 世界。在 QEMU 中由 q35 机器类型提供</li>
+    <li><strong>Root Port (RP)</strong>：RC 的下行端口。每个 RP 定义一条新的 PCI 总线。在配置空间中表现为 <strong>Type 1 header</strong>（PCI-to-PCI bridge）</li>
+    <li><strong>Endpoint (EP)</strong>：树的叶子节点。在配置空间中表现为 <strong>Type 0 header</strong></li>
+</ul>
+
+<div class="ascii-diagram">
+     QEMU q35 PCIe 拓扑（本实验）：
+
+     Root Complex (q35, bus 00)
+     │
+     ├── 00:00.0  Host Bridge (8086:29c0)
+     ├── 00:01.0  PCIe Root Port (1b36:000c) ← Type 1 Bridge
+     │    │
+     │    └── 01:00.0  virtio-rng 端点 (1af4:1044) ← Type 0 Endpoint
+     │
+     ├── 00:1f.0  ISA Bridge
+     ├── 00:1f.2  SATA Controller
+     └── 00:1f.3  SMBus Controller
+
+     Root Port 创建了 Secondary Bus = 01
+     总线 01 上只有 01:00.0 这一个设备
+</div>
+
+<h3>总线编号与 sysfs 路径</h3>
+<p>Root Port 的配置空间中包含了三个总线编号：</p>
+<ul>
+    <li><strong>Primary Bus</strong>：上游总线（bus 00）</li>
+    <li><strong>Secondary Bus</strong>：桥的下行总线（bus 01）</li>
+    <li><strong>Subordinate Bus</strong>：桥以下最高编号的总线（bus 01，因为下面没有更多桥）</li>
+</ul>
+
+<p>Linux 根据这些信息构建 sysfs 中的<strong>设备拓扑路径</strong>：</p>
+<pre><code>/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0
+                        └──Root Port──┘└──Endpoint──┘</code></pre>
+
+<p>路径的嵌套关系直接反映了 PCIe 的物理拓扑层级。</p>
+</section>
+
+<section id="guide">
+<h2>实验指导</h2>
+
+<h3>目标</h3>
+<p>引入 PCIe Root Port 和端点，观察 PCI 总线编号扩展和 sysfs 层级路径。</p>
+
+<h3>操作步骤</h3>
+
+<ol>
+    <li><strong>运行自动观察：</strong>
+        <pre><code>make verify-03</code></pre>
+    </li>
+    <li><strong>交互式探索：</strong>
+        <pre><code>make run-03</code></pre>
+        在 guest shell 中：
+        <pre><code>lspci -nn
+cat /sys/bus/pci/devices/0000:00:01.0/secondary_bus_number
+cat /sys/bus/pci/devices/0000:00:01.0/subordinate_bus_number
+readlink -f /sys/bus/pci/devices/0000:01:00.0</code></pre>
+    </li>
+</ol>
+
+<h3>预期观察</h3>
+<ul>
+    <li>function count = <strong>6</strong>（4 芯片组 + 1 Root Port + 1 端点）</li>
+    <li>Root Port：vendor=0x1b36, device=0x000c, class=0x060400 (PCI bridge)</li>
+    <li>Root Port：secondary_bus=1, subordinate_bus=1</li>
+    <li>端点：vendor=0x1af4, device=0x1044 (virtio-rng)</li>
+    <li>端点 sysfs 路径包含父桥 BDF：<code>.../0000:00:01.0/0000:01:00.0</code></li>
+</ul>
+
+<h3>解释</h3>
+<p>Root Port 是一个 <strong>Type 1 PCI-to-PCI bridge</strong>。它创建了二级总线（bus 01），端点就在这条总线上被发现。sysfs 中的目录嵌套（而不是平铺）直接反映了物理拓扑层级 —— 这是理解更复杂 PCIe 拓扑的基础。</p>
+
+<div class="callout callout-info">
+    <strong>为什么这很重要：</strong>每个 Root Port 只能连接一个端点（PCIe 是点对点的）。要通过一个 RP 连接多个设备，需要在 RP 和端点之间加一个 PCIe Switch。Switch 是未来实验的主题。
+</div>
+</section>
+
+<div class="bottom-nav">
+    <a class="prev" href="lecture-02.html">实验 02: 传统PCI设备</a>
+    <a class="next" href="lecture-04.html">实验 04: 配置空间头部</a>
+</div>
+
+</main>
+</div>
+<footer class="site-footer">
+    <p>PCIe/CXL Playground &mdash; Built for understanding, not for production.</p>
+</footer>
+</body>
+</html>

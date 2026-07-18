@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Lecture 09: CXL拓扑 — PCIe/CXL Playground</title>
+    <link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+<nav class="top-nav">
+    <div class="nav-brand"><span class="brand-icon">&#x2b22;</span>PCIe/CXL Playground</div>
+    <div class="nav-links">
+        <a href="index.html">Home</a>
+        <span class="nav-sep">|</span>
+        <a href="lecture-01.html">01</a>
+        <a href="lecture-02.html">02</a>
+        <a href="lecture-03.html">03</a>
+        <a href="lecture-04.html">04</a>
+        <a href="lecture-05.html">05</a>
+        <a href="lecture-06.html">06</a>
+        <a href="lecture-07.html">07</a>
+        <a href="lecture-09.html">09</a>
+        <a href="lecture-10.html">10</a>
+    </div>
+</nav>
+<div class="lecture-layout">
+<aside class="sidebar">
+    <h3>本讲内容</h3>
+    <a href="#principle" class="toc-item">原理</a>
+    <a href="#guide" class="toc-item">实验指导</a>
+    <div class="exp-list">
+        <h3>全部实验</h3>
+        <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
+        <a href="lecture-02.html" class="exp-link">02 传统PCI设备</a>
+        <a href="lecture-03.html" class="exp-link">03 Root Port与端点</a>
+        <a href="lecture-04.html" class="exp-link">04 配置空间头部</a>
+        <a href="lecture-05.html" class="exp-link">05 BAR与资源分配</a>
+        <a href="lecture-06.html" class="exp-link">06 驱动匹配与绑定</a>
+        <a href="lecture-07.html" class="exp-link">07 MSI/MSI-X中断</a>
+        <a href="lecture-09.html" class="exp-link current">09 CXL拓扑</a>
+        <a href="lecture-10.html" class="exp-link">10 CXL解码器与区域</a>
+    </div>
+</aside>
+<main class="lecture-main">
+
+<h1>实验 09: CXL 拓扑 — Host Bridge, Root Port 与 Type 3 设备</h1>
+<p class="lecture-meta">Part 2 · CXL 内存语义 · PCIe 之上的内存协议层</p>
+
+<section id="principle">
+<h2>原理</h2>
+
+<h3>CXL 是什么</h3>
+<p><strong>CXL (Compute Express Link)</strong> 是在 PCIe 5.0/6.0 物理层之上构建的协议，为数据中心工作负载添加了<strong>内存语义</strong>。它复用了 PCIe 的电气信号、枚举机制和配置空间模型，但引入了三个独立于 PCIe 的协议子层：</p>
+
+<ul>
+    <li><strong>CXL.io</strong>：设备发现、配置、寄存器访问（本质上是 PCIe，用于枚举）</li>
+    <li><strong>CXL.cache</strong>：主机 CPU 缓存与设备缓存之间的一致性协议（Type 1/2 设备）</li>
+    <li><strong>CXL.mem</strong>：主机 CPU 直接访问设备内存的 load/store 协议（Type 3 设备）</li>
+</ul>
+
+<h3>CXL 设备类型</h3>
+
+<table>
+    <tr><th>Type</th><th>协议</th><th>典型设备</th></tr>
+    <tr><td>Type 1</td><td>CXL.io + CXL.cache</td><td>智能网卡（无本地内存）</td></tr>
+    <tr><td>Type 2</td><td>CXL.io + CXL.cache + CXL.mem</td><td>GPU、FPGA、加速器（有本地内存）</td></tr>
+    <tr><td><strong>Type 3</strong></td><td><strong>CXL.io + CXL.mem</strong></td><td><strong>内存扩展器（本实验）</strong></td></tr>
+</table>
+
+<h3>最小 CXL 拓扑</h3>
+
+<div class="ascii-diagram">
+     CXL 拓扑（QEMU 8.2）：
+
+     Host CPU
+        │
+     Root Complex (q35, bus 00)
+        │
+        ├── 00:00.0  Host Bridge
+        ├── 00:01.0  CXL Host Bridge (pxb-cxl, 1b36:000b, bus_nr=12)
+        │    │         Class 0600 — PCIe 看来是普通的 Host Bridge
+        │    │         CXL 看来是 CFMW 的入口点
+        │    │
+        │    └── 0c:00.0  CXL Root Port (8086:7075)
+        │         │         Class 0604 — PCIe 看来是普通 Bridge
+        │         │         CXL 看来是 CXL.io 下行端口
+        │         │
+        │         └── 0d:00.0  CXL Type 3 Memory Device (8086:0d93)
+        │                        Class 0502 — CXL Memory Device
+        │                        256MB 易失性内存（RAM backing）
+        │
+        └── 00:1f.x  ICH9 芯片组（ISA、SATA、SMBus）
+
+     同时，Linux 还创建了 /sys/bus/cxl/：
+        root0 → decoder0.0 (CFMW: 4GB @ 0x4f0000000)
+          └── port1 → decoder1.0
+                └── endpoint2 → decoder2.0–2.3 (HDM decoders)
+                      └── mem0 (payload_max=2048, ram=256MB)
+</div>
+
+<h3>协议分层：PCIe 之下，CXL 之上</h3>
+<p>CXL 设备<strong>同时是两个子系统中的公民</strong>：</p>
+<ul>
+    <li>在 <strong>PCI 子系统</strong>中，它们拥有 BDF 地址、配置空间和能力链表——<code>lspci</code> 能看到它们</li>
+    <li>在 <strong>CXL 子系统</strong>中，它们拥有内存解码器、容量属性和区域管理——<code>/sys/bus/cxl/</code> 暴露内存语义</li>
+</ul>
+
+<div class="callout callout-info">
+    <strong>核心洞察：</strong>CXL 不重新发明轮子。它使用 PCIe 用于设备发现、配置和 MMIO 寄存器访问（CXL.io），然后在其之上添加内存特定的协议（CXL.mem）。这种 "PCIe + 扩展" 的设计是理解所有 CXL 概念的关键。
+</div>
+</section>
+
+<section id="guide">
+<h2>实验指导</h2>
+
+<h3>目标</h3>
+<p>构建最小 CXL 拓扑（一个 Host Bridge + 一个 Root Port + 一个 Type 3 内存设备），通过 <code>lspci</code> 和 <code>/sys/bus/cxl/</code> 对比 PCIe 视角和 CXL 视角。</p>
+
+<h3>操作步骤</h3>
+
+<ol>
+    <li><strong>运行自动观察：</strong>
+        <pre><code>make verify-09</code></pre>
+    </li>
+    <li><strong>交互式探索：</strong>
+        <pre><code>make run-09</code></pre>
+        在 guest shell 中：
+        <pre><code># PCIe 视角
+lspci -nn
+
+# CXL 视角
+ls -la /sys/bus/cxl/devices/
+
+# CFMW（固定内存窗口）
+cat /sys/bus/cxl/devices/decoder0.0/start
+cat /sys/bus/cxl/devices/decoder0.0/size
+
+# 内存设备容量
+cat /sys/bus/cxl/devices/mem0/payload_max
+cat /sys/bus/cxl/devices/mem0/ram/size
+ls /sys/bus/cxl/devices/mem0/</code></pre>
+    </li>
+</ol>
+
+<h3>预期观察</h3>
+<ul>
+    <li><code>lspci</code>：CXL Host Bridge (class 0600, 1b36:000b)、CXL Root Port (class 0604)、CXL Type 3 设备 (<strong>class 0502</strong>, 8086:0d93)</li>
+    <li><code>/sys/bus/cxl/devices/</code>：10 个条目 — root0、port1、endpoint2、mem0、6 个 decoder</li>
+    <li>CFMW decoder0.0：start=0x4f0000000、size=0x100000000 (4GB)</li>
+    <li>mem0：payload_max=2048、ram/size=0x10000000 (256MB)、pmem/size=0x0</li>
+</ul>
+
+<h3>解释</h3>
+<p>class 0502 是 CXL Type 3 Memory Device 的 PCI class code。CXL Type 3 设备在 PCIe 层面是完全合法的 PCI function，但它们的主要用途不是 I/O，而是<strong>通过 CXL.mem 协议向主机提供可寻址内存</strong>。CFMW (CXL Fixed Memory Window) 是平台固件（通过 ACPI CEDT 表）在物理地址空间中为 CXL 内存保留的一段连续区域。</p>
+
+<div class="callout callout-tip">
+    <strong>提示：</strong>比较 <code>lspci</code> 中 class 0502 设备和 class 00ff00 (virtio-rng) 设备。两者都是 Type 0 header 的 PCIe 端点，但 class 0502 告诉 OS："我不是普通的 I/O 设备，我是内存。"
+</div>
+</section>
+
+<div class="bottom-nav">
+    <a class="prev" href="lecture-07.html">实验 07: MSI/MSI-X中断</a>
+    <a class="next" href="lecture-10.html">实验 10: CXL解码器与区域</a>
+</div>
+
+</main>
+</div>
+<footer class="site-footer">
+    <p>PCIe/CXL Playground &mdash; Built for understanding, not for production.</p>
+</footer>
+</body>
+</html>
