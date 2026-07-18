@@ -1,0 +1,185 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第四课 · 数据路径深入 — RDMA 课程</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 课程课件</a></h2>
+  <nav>
+    <div class="section-label">课时</div>
+    <ul>
+      <li><a href="0001-dma-to-rdma.html">01 · 从 DMA 到 RDMA</a></li>
+      <li><a href="0002-device-and-env.html">02 · 设备发现与环境</a></li>
+      <li><a href="0003-core-objects.html">03 · 核心对象模型</a></li>
+      <li><a href="0004-data-path.html" class="active">04 · 数据路径深入</a></li>
+      <li><a href="0005-connection-models.html">05 · 连接模型</a></li>
+      <li><a href="0006-to-production.html">06 · 走向生产</a></li>
+    </ul>
+    <div class="section-label">参考</div>
+    <ul>
+      <li><a href="../reference/lab-guide.html">实验指导</a></li>
+      <li><a href="../reference/index.html">参考讲义</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>第四课 · 数据路径深入</h1>
+<p class="subtitle">追踪一个字节从发送缓冲区到接收缓冲区的完整旅程</p>
+
+<h2>场景设定</h2>
+
+<p>假设一个简单的场景：Client 通过 RC QP 向 Server 发送字符串 "Hello RDMA"。两个节点通过 Soft-RoCE 互联，IP 地址分别是 10.0.2.7（Server）和 10.0.2.15（Client）。</p>
+
+<p>这个场景涵盖了一个 RDMA SEND 操作从应用到网络的完整数据路径。我们将分别追踪 Client 侧和 Server 侧的每一步。</p>
+
+<h2>Client 侧：发送路径</h2>
+
+<h3>步骤 1 — 准备缓冲区</h3>
+<p>应用分配一个已注册 MR 的缓冲区，填入数据 "Hello RDMA"（假设 11 字节）。构造 <code>ibv_send_wr</code> 结构体，设置 opcode 为 <code>IBV_WR_SEND</code>，sg_list 指向该缓冲区的 SGE。</p>
+
+<h3>步骤 2 — 提交 WR（ibv_post_send）</h3>
+<p>应用调用 <code>ibv_post_send(qp, &wr, &bad_wr)</code>。在用户态，libibverbs 将 <code>ibv_send_wr</code> 转换为硬件 WQE（Work Queue Element）格式，写入 SQ 的共享内存环形缓冲区，最后写入 doorbell 寄存器通知内核/硬件有新 WQE 到达。</p>
+
+<p>对于 Soft-RoCE（RXE），由于没有 MMIO doorbell，<code>ibv_post_send</code> 会触发 <code>write()</code> 系统调用进入内核模块。</p>
+
+<h3>步骤 3 — 内核处理 WQE</h3>
+<p>RXE 内核模块读取 WQE，解析 opcode 和 SGE 列表。通过 <code>copy_from_user</code> 将用户缓冲区的数据拷贝到内核 <code>skb</code> 中。同时验证 MR 的 lkey 是否有效。</p>
+
+<h3>步骤 4 — 分组化与发送</h3>
+<p>RXE 构造 IB BTH（Base Transport Header），填充目的 QPN、PSN、opcode 等字段。将 BTH + payload 封装到一个 <code>sk_buff</code> 中，添加 UDP 头（目的端口 4791）、IP 头，最后通过内核网络栈发送出去。</p>
+
+<h3>步骤 5 — 产生完成事件</h3>
+<p>发送完成后（对于 RC，需要收到对端 ACK），内核生成 WC 写入 CQ。应用通过 <code>ibv_poll_cq(cq, 1, &wc)</code> 获取完成通知，检查 <code>wc.status == IBV_WC_SUCCESS</code>。</p>
+
+<div class="diagram">Client SEND 数据路径:
+
+  [App Buffer: "Hello RDMA"]
+        |
+    ibv_post_send(qp, &wr)
+        |
+    [User lib: WR → WQE format]
+        |  write() syscall (RXE)
+    [Kernel RXE: copy_from_user → skb]
+        |
+    [BTH | payload] → [UDP | IB] → [IP | UDP | IB]
+        |
+    [Kernel netstack → eth0 NIC]
+        |
+    --- wire ---></div>
+
+<h2>Server 侧：接收路径</h2>
+
+<h3>步骤 1 — 预提交 RECV WR</h3>
+<p>Server 在通信开始之前（甚至在 Client 发送之前）已经调用 <code>ibv_post_recv(qp, &recv_wr, &bad_wr)</code> 将一个空缓冲区提交到了 RQ。这是 RDMA 接收的关键：<strong>接收缓冲区必须提前就位</strong>。</p>
+
+<h3>步骤 2 — 数据包到达</h3>
+<p>Server 的 eth0 收到 UDP 包。内核网络栈根据 UDP 端口 4791 将包路由给 RXE 内核模块。RXE 解析 UDP payload，提取 IB BTH 获取 QPN。</p>
+
+<h3>步骤 3 — 匹配 RQ WQE</h3>
+<p>RXE 根据 QPN 找到对应的 QP，从 RQ 头部取出预先提交的 RECV WQE。对比数据包 payload 长度和 WQE 描述缓冲区大小（足够容纳，否则丢弃）。</p>
+
+<h3>步骤 4 — 数据写入接收缓冲区</h3>
+<p>RXE 解析 SGE 列表，将 payload 通过 <code>copy_to_user</code> 拷贝到用户态的接收缓冲区内。至此，数据已经到达 Server 应用的内存空间。</p>
+
+<h3>步骤 5 — 生成 WC</h3>
+<p>RXE 在 Server 的 CQ 中生成一个 WC 条目，包含：<code>opcode = IBV_WC_RECV</code>，<code>byte_len = 11</code>，<code>wr_id = recv_wr.wr_id</code>。</p>
+
+<h3>步骤 6 — 应用轮询</h3>
+<p>Server 应用调用 <code>ibv_poll_cq(cq, 1, &wc)</code> 获得 WC，检查 <code>wc.status</code> 确认操作成功，读取 <code>wc.byte_len</code> 获知实际数据大小，然后消费缓冲区中的数据。</p>
+
+<div class="diagram">Server RECV 数据路径:
+
+  --- wire --->
+        |
+    [eth0 NIC → kernel netstack]
+        |  UDP port 4791
+    [Kernel RXE: parse BTH → find QP]
+        |
+    [Match pre-posted RQ WQE]
+        |
+    [copy_to_user: payload → App buffer]
+        |
+    [CQ entry: wr_id, byte_len=11, status=SUCCESS]
+        |
+    ibv_poll_cq(cq, 1, &wc)
+        |
+    [App consumes data]</div>
+
+<div class="callout warn">
+<strong>预提交 RECV 的重要性</strong>
+如果 Server 没有提前 post_recv，数据包到达时 RQ 为空。对于 RC QP，接收端硬件会发送 NAK，发起端会重传。但如果 RQ 持续为空，最终发送端会因超时而断开连接（超过 <code>retry_cnt</code>）。这是初学 RDMA 最常见的 bug 之一。
+</div>
+
+<h2>控制面 vs 数据面</h2>
+
+<p><code>ibv_post_send</code> 和 <code>ibv_post_recv</code> 属于 <strong>控制面</strong> 操作——它们向硬件提交描述符（WQE），但实际数据搬运由 <strong>数据面</strong> 完成。区分这两者是理解 RDMA 性能的关键：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>方面</th><th>控制面</th><th>数据面</th></tr>
+</thead>
+<tbody>
+<tr><td>典型操作</td><td>ibv_post_send, ibv_post_recv, ibv_poll_cq</td><td>DMA 读写（硬件）或 memcpy（RXE）</td></tr>
+<tr><td>频率</td><td>每个消息一次</td><td>每个消息一次（但由硬件并行）</td></tr>
+<tr><td>CPU 开销</td><td>低（WQE 构建）</td><td>零（硬件 DMA）或高（RXE memcpy）</td></tr>
+<tr><td>系统调用</td><td>是（对 RXE）</td><td>否（DMA 直接）</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>RDMA WRITE 路径</h2>
+
+<p>SEND/RECV 需要两端配合（一端 post_send，另一端先 post_recv）。而 RDMA WRITE 则完全不同：</p>
+
+<ul>
+  <li><strong>不需要对端 post_recv</strong> — 数据直接写入对端预先注册好的 MR 缓冲区</li>
+  <li><strong>对端 CPU 不参与</strong> — 对端 HCA 验证 rkey 后直接 DMA 写入内存</li>
+  <li><strong>Completion 仅在发起方</strong> — 对端不会收到任何 WC</li>
+</ul>
+
+<p>WRITE 的 WQE 需要额外指定：<code>wr.rdma.remote_addr</code>（对端虚拟地址）和 <code>wr.rdma.rkey</code>（对端 MR 的远程密钥）。这两个信息必须通过带外通道（如 TCP 连接）预先交换。</p>
+
+<h3>WRITE_WITH_IMM</h3>
+
+<p>这是一个特殊变体：它像 RDMA WRITE 一样写入数据，但会在对端生成一个含有 <code>imm_data</code>（32 位立即数）的 RECV 完成。对端收到 WC 后可以知道数据已到达。</p>
+
+<p>这也是生产中最常用的通知模式：用 RDMA WRITE 传输大数据块，然后用 WRITE_WITH_IMM 发一个小通知告诉对端"数据已就绪"。</p>
+
+<h2>Kernel Bypass 对比</h2>
+
+<div class="diagram">传统 Socket 数据路径:
+  [App Buffer] ──CPU copy──→ [Kernel Socket Buffer] ──DMA──→ [NIC]
+       ↑                            ↑
+  (copy_from_user)             (TCP stack)
+  1 syscall + 1 copy           2 syscalls + 1 copy
+
+RDMA 数据路径:
+  [App Buffer] ──────────DMA──────────→ [NIC]
+       ↑
+  (MMIO doorbell, no syscall for data)
+  0 syscall + 0 extra copy</div>
+
+<p>传统 socket 需要多次系统调用和数据拷贝：<code>send()</code> 将数据从用户空间拷贝到内核 TCP 缓冲区，然后 NIC 通过 DMA 从内核缓冲区读取。接收端同样需要两次拷贝。</p>
+
+<p>RDMA 消除了所有中间拷贝：NIC 直接从用户缓冲区 DMA 读取数据。对于 Soft-RoCE，虽然没有 DMA 卸载，但 Verbs API 语义与硬件完全一致——你的代码不需要修改即可移植到真实 RNIC。</p>
+
+<div class="callout">
+<strong>学习路线图</strong>
+现在你知道数据如何在单条连接上传输了。下一课我们将解决一个重要问题：在数据可以传输之前，通信双方是如何建立 QP 连接的？我们将学习两种连接模型：手动 TCP + raw verbs 和 RDMA CM 事件驱动。
+</div>
+
+<footer class="footer">
+  <nav><a href="0003-core-objects.html">← 上一课</a><a href="index.html">课时列表</a><a href="0005-connection-models.html">下一课 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

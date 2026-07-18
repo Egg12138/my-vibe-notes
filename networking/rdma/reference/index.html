@@ -1,0 +1,189 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDMA 工程实践 — 教学参考</title>
+<link rel="stylesheet" href="../assets/course.css">
+<style>
+  .hero { text-align:center; padding:2.5rem 0 1.5rem; }
+  .hero h1 { font-size:2.6rem; margin-bottom:0.5rem; }
+  .hero .tagline { font-size:1.1rem; color:var(--color-text-secondary); max-width:600px; margin:0 auto; }
+  .stats { display:flex; gap:2rem; justify-content:center; margin:1.5rem 0 2.5rem; }
+  .stat { text-align:center; }
+  .stat .num { font-size:2rem; font-weight:700; color:var(--color-accent); }
+  .stat .label { font-size:0.8rem; color:var(--color-text-secondary); }
+</style>
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+    <div class="section-label">实验</div>
+    <ul>
+      <li><a href="../labs/README.md">实验目录</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main portal">
+
+<div class="hero">
+  <h1>RDMA 工程实践</h1>
+  <p class="tagline">从 verbs 对象到生产抽象，系统掌握 Remote Direct Memory Access 的完整知识体系</p>
+  <div class="stats">
+    <div class="stat"><div class="num">9</div><div class="label">参考专题</div></div>
+    <div class="stat"><div class="num">6</div><div class="label">动手实验</div></div>
+    <div class="stat"><div class="num">3</div><div class="label">提示层级</div></div>
+    <div class="stat"><div class="num">0</div><div class="label">硬件依赖</div></div>
+  </div>
+</div>
+
+<div class="section-divider"><span>实验指导</span></div>
+<div class="card-grid">
+
+<a class="card" href="lab-guide.html">
+  <div class="card-num">Guide</div>
+  <h3>实验指导说明</h3>
+  <p>环境搭建、命令行操作、实验工作流、目录结构与故障排查快速参考。在开始实验 00 之前完整阅读。</p>
+  <div class="card-tags"><span class="tag">操作</span><span class="tag">工作流</span><span class="tag">排错</span></div>
+</a>
+
+</div>
+
+<div class="section-divider"><span>核心概念</span></div>
+<div class="card-grid">
+
+<a class="card" href="00-glossary.html">
+  <div class="card-num">Reference 00</div>
+  <h3>术语表</h3>
+  <p>RDMA/InfiniBand/RoCE/Soft-RoCE 核心术语速查。适合在阅读后续讲义时随时对照。</p>
+  <div class="card-tags"><span class="tag">概念</span><span class="tag">速查</span></div>
+</a>
+
+<a class="card" href="01-rdma-data-path.html">
+  <div class="card-num">Reference 01</div>
+  <h3>RDMA 数据路径</h3>
+  <p>从应用到 RNIC/Soft-RoCE 的完整数据路径图解。理解 user library → uverbs → kernel → hardware 的分层关系。</p>
+  <div class="card-tags"><span class="tag">架构</span><span class="tag">数据面</span><span class="tag">分层</span></div>
+</a>
+
+<a class="card" href="02-verbs-object-lifecycle.html">
+  <div class="card-num">Reference 02</div>
+  <h3>Verbs 对象生命周期</h3>
+  <p>Context、Protection Domain、Memory Region、Completion Queue、Queue Pair 的创建、使用与销毁顺序。理解依赖关系为什么重要。</p>
+  <div class="card-tags"><span class="tag">API</span><span class="tag">生命周期</span><span class="tag">依赖</span></div>
+</a>
+
+<a class="card" href="03-qp-state-and-completion.html">
+  <div class="card-num">Reference 03</div>
+  <h3>QP 状态机与 Work Completion</h3>
+  <p>RC QP 的 RESET→INIT→RTR→RTS 状态迁移，以及 WC 作为完成证据的设计语义。</p>
+  <div class="card-tags"><span class="tag">状态机</span><span class="tag">CQ</span><span class="tag">WC</span></div>
+</a>
+
+</div>
+
+<div class="section-divider"><span>进阶主题</span></div>
+<div class="card-grid">
+
+<a class="card" href="04-memory-registration-and-rkey.html">
+  <div class="card-num">Reference 04</div>
+  <h3>内存注册与 rkey</h3>
+  <p>内存 pinning、lkey/rkey 访问控制、权限模型。为什么 rkey 是能力凭证但不是完整安全方案。</p>
+  <div class="card-tags"><span class="tag">内存</span><span class="tag">安全</span><span class="tag">MR</span></div>
+</a>
+
+<a class="card" href="05-rdma-cm-state-machine.html">
+  <div class="card-num">Reference 05</div>
+  <h3>RDMA CM 状态机</h3>
+  <p>地址解析、路由解析、连接建立与断开的异步事件模型。CM event 确认与超时管理。</p>
+  <div class="card-tags"><span class="tag">CM</span><span class="tag">连接管理</span><span class="tag">异步</span></div>
+</a>
+
+<a class="card" href="06-performance-methodology.html">
+  <div class="card-num">Reference 06</div>
+  <h3>性能测量方法论</h3>
+  <p>延迟 vs 带宽、queue depth、signaled 策略、CPU 亲和性。Soft-RoCE/TCG 的可信边界。</p>
+  <div class="card-tags"><span class="tag">性能</span><span class="tag">benchmark</span><span class="tag">可观测性</span></div>
+</a>
+
+</div>
+
+<div class="section-divider"><span>工程视野</span></div>
+<div class="card-grid">
+
+<a class="card" href="07-production-ecosystem.html">
+  <div class="card-num">Reference 07</div>
+  <h3>生产 RDMA 生态</h3>
+  <p>libfabric、UCX、MPI、NCCL 的层次定位。何时选择 raw verbs vs RDMA CM vs 高层抽象。</p>
+  <div class="card-tags"><span class="tag">生态</span><span class="tag">libfabric</span><span class="tag">UCX</span><span class="tag">生产</span></div>
+</a>
+
+<a class="card" href="08-troubleshooting.html">
+  <div class="card-num">Reference 08</div>
+  <h3>故障诊断指南</h3>
+  <p>设备发现失败、QP 状态卡死、RNR 重传、资源泄漏等常见问题的系统化排查流程。</p>
+  <div class="card-tags"><span class="tag">诊断</span><span class="tag">排错</span><span class="tag">工具</span></div>
+</a>
+
+</div>
+
+<div class="section-divider"><span>课件与实验</span></div>
+<div class="card-grid">
+
+<a class="card" href="../lessons/index.html">
+  <div class="card-num">Lessons</div>
+  <h3>课程课件</h3>
+  <p>按学习顺序编排的独立课时，每课聚焦一个主题，配合对应实验使用。</p>
+  <div class="card-tags"><span class="tag">课件</span><span class="tag">渐进</span></div>
+</a>
+
+<a class="card" href="../labs/README.md">
+  <div class="card-num">Labs</div>
+  <h3>动手实验</h3>
+  <p>6 个渐进实验，包含 starter、hints、自动验收和反思题。在 QEMU + Soft-RoCE 环境完成。</p>
+  <div class="card-tags"><span class="tag">实验</span><span class="tag">动手</span><span class="tag">验收</span></div>
+</a>
+
+</div>
+
+<footer class="footer">
+  <p>RDMA 工程实践课程 · 基于 Linux rdma-core + Soft-RoCE · 所有内容可离线使用</p>
+  <nav>
+    <a href="00-glossary.html">术语表</a>
+    <a href="01-rdma-data-path.html">数据路径</a>
+    <a href="08-troubleshooting.html">故障诊断</a>
+  </nav>
+</footer>
+
+</main>
+</body>
+</html>

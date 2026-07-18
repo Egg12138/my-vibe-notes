@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>QP 状态机与 Work Completion — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html" class="active">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>QP 状态机与 Work Completion</h1>
+<p class="subtitle">RC QP 状态迁移的每一步，以及 WC 作为完成证据而非业务协议的语义</p>
+
+<h2>QP 状态总览</h2>
+
+<p>Queue Pair 在创建后需要经过一系列状态迁移才能收发数据。状态由 <code>ibv_modify_qp()</code> 驱动，每次迁移指定一组必需属性。QP 状态机是 RDMA 编程中最容易出错的环节之一。</p>
+
+<div class="state-machine">
+  <div class="state-node">RESET</div>
+  <div class="state-arrow">→</div>
+  <div class="state-node">INIT</div>
+  <div class="state-arrow">→</div>
+  <div class="state-node">RTR</div>
+  <div class="state-arrow">→</div>
+  <div class="state-node active">RTS</div>
+  <div class="state-arrow">↔</div>
+  <div class="state-node active">SQ Drain</div>
+  <div class="state-arrow">↓</div>
+  <div class="state-node error">ERROR</div>
+  <div class="state-arrow">→</div>
+  <div class="state-node">RESET</div>
+</div>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>状态</th><th>顺序</th><th>SEND</th><th>RECV</th><th>RDMA WRITE</th><th>RDMA READ</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>RESET</strong></td><td>1</td><td>否</td><td>否</td><td>否</td><td>否</td><td>QP 刚创建后的初始状态。SQ 和 RQ 均为空，未绑定端口。</td></tr>
+<tr><td><strong>INIT</strong></td><td>2</td><td>否</td><td>可 post</td><td>否</td><td>否</td><td>QP 已绑定端口和 PD。可以 post RECV，但不能发送。必须在此状态 post RECV 以确保接收端就绪。</td></tr>
+<tr><td><strong>RTR</strong></td><td>3</td><td>否</td><td>可 post</td><td>否</td><td>否</td><td>Ready to Receive。QP 知道对端的 QPN、PSN、地址等信息。可以接收数据。不能发送。</td></tr>
+<tr><td><strong>RTS</strong></td><td>4</td><td>可</td><td>可 post</td><td>可</td><td>可</td><td>Ready to Send。全功能状态，可收发所有支持类型的操作。</td></tr>
+<tr><td><strong>SQ Drain</strong></td><td>—</td><td>否</td><td>—</td><td>否</td><td>否</td><td>自动过渡状态。SQ 中所有已提交的 WR 被 flush 到 CQ，完成后进入 SQD。</td></tr>
+<tr><td><strong>SQD</strong></td><td>—</td><td>否</td><td>—</td><td>否</td><td>否</td><td>SQ Drained。SQ 已空。可用于修改 QP 属性（如 path MTU、重传参数），后再回到 RTS。</td></tr>
+<tr><td><strong>ERROR</strong></td><td>—</td><td>否</td><td>否</td><td>否</td><td>否</td><td>出现不可恢复错误。SQ 和 RQ 中所有待处理的 WR 被 flush（WC 返回 flush 状态）。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>RESET → INIT</h2>
+
+<p>离开 RESET 进入 INIT，让 QP 绑定到具体的端口和 P_Key 域，同时声明本地访问权限。</p>
+
+<h3>必需属性</h3>
+
+<table>
+<thead>
+<tr><th>属性标志</th><th>用途</th></tr>
+</thead>
+<tbody>
+<tr><td><code>IBV_QP_STATE</code></td><td>目标状态: <code>IBV_QPS_INIT</code></td></tr>
+<tr><td><code>IBV_QP_PKEY_INDEX</code></td><td>P_Key 表索引（通常为 0，对应缺省 P_Key 0xFFFF）</td></tr>
+<tr><td><code>IBV_QP_PORT</code></td><td>QP 绑定的端口号（1 起始）</td></tr>
+<tr><td><code>IBV_QP_ACCESS_FLAGS</code></td><td>声明本端允许的远程操作类型：<code>IBV_ACCESS_REMOTE_WRITE</code>、<code>IBV_ACCESS_REMOTE_READ</code>、<code>IBV_ACCESS_REMOTE_ATOMIC</code></td></tr>
+</tbody>
+</table>
+
+<pre><code>struct ibv_qp_attr attr = {
+    .qp_state        = IBV_QPS_INIT,
+    .pkey_index      = 0,
+    .port_num        = 1,
+    .qp_access_flags = IBV_ACCESS_REMOTE_WRITE | IBV_ACCESS_REMOTE_READ,
+};
+ibv_modify_qp(qp, &attr,
+    IBV_QP_STATE | IBV_QP_PKEY_INDEX | IBV_QP_PORT | IBV_QP_ACCESS_FLAGS);</code></pre>
+
+<div class="callout note">
+<strong>注意</strong>
+<code>qp_access_flags</code> 设置的是本地 QP <strong>允许对端</strong> 进行的远程操作（当本端收到 RDMA WRITE 时）。在 RC 中，通信双方的 access_flags 可以不同。例如一端只允许远程读，另一端允许远程写。这并不影响本地发起的操作。
+</div>
+
+<h2>INIT → RTR</h2>
+
+<p>这是最复杂的状态迁移。必须提供对端的完整地址信息，使 QP 能正确发送/接收数据包。此步要求双方通过带外通道交换 QPN、PSN、GID 等信息。</p>
+
+<h3>必需属性</h3>
+
+<table>
+<thead>
+<tr><th>属性标志</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>IBV_QP_STATE</code></td><td><code>IBV_QPS_RTR</code></td></tr>
+<tr><td><code>IBV_QP_AV</code></td><td>Address Vector：包含对端 GID/LID、GRH 标志、流量等级、SL、端口号等。对于 RoCE 必须设置 GRH=1 并填充 SGID 和 DGID。</td></tr>
+<tr><td><code>IBV_QP_PATH_MTU</code></td><td>路径 MTU，双方必须一致。通常设为 1024 或 4096。</td></tr>
+<tr><td><code>IBV_QP_DEST_QPN</code></td><td>对端 QP 的编号（<code>qp-&gt;qp_num</code>）</td></tr>
+<tr><td><code>IBV_QP_RQ_PSN</code></td><td>本端 RQ 期望接收到的第一个数据包的 PSN。必须与对端 SQ PSN 一致。</td></tr>
+<tr><td><code>IBV_QP_MAX_DEST_RD_ATOMIC</code></td><td>本端允许对端发起的未完成 RDMA READ/ATOMIC 请求数量上限。</td></tr>
+<tr><td><code>IBV_QP_MIN_RNR_TIMER</code></td><td>本端 RQ 未就绪（RNR）时，向对端发送 RNR NACK 之间的最小延迟（指数编码，参考 IBTA spec Table 124）。</td></tr>
+</tbody>
+</table>
+
+<pre><code>struct ibv_qp_attr attr = { 0 };
+attr.qp_state              = IBV_QPS_RTR;
+attr.path_mtu              = IBV_MTU_1024;
+attr.dest_qp_num           = remote_qpn;
+attr.rq_psn                = remote_psn;   // 对端的起始发送 PSN
+attr.max_dest_rd_atomic    = 1;
+attr.min_rnr_timer         = 12;           // ≈ 1.28 us
+
+// Address Vector (RoCEv2)
+attr.ah_attr.is_global     = 1;
+attr.ah_attr.grh.dgid      = remote_gid;
+attr.ah_attr.grh.sgid_index = local_sgid_idx;
+attr.ah_attr.grh.hop_limit  = 1;
+attr.ah_attr.grh.traffic_class = 0;
+attr.ah_attr.port_num      = 1;
+
+ibv_modify_qp(qp, &attr,
+    IBV_QP_STATE | IBV_QP_AV | IBV_QP_PATH_MTU |
+    IBV_QP_DEST_QPN | IBV_QP_RQ_PSN |
+    IBV_QP_MAX_DEST_RD_ATOMIC | IBV_QP_MIN_RNR_TIMER);</code></pre>
+
+<div class="callout warn">
+<strong>关键错误</strong>
+<code>rq_psn</code> 必须与对端配置的 <code>sq_psn</code> 严格一致。PSN 不匹配会导致对端发送的所有数据包被视为序列号错误而被丢弃，表现为 QP 卡在 RTR/RTS 但无法接收任何数据（<code>dmesg</code> 中可见 "packet sequence number error"）。
+</div>
+
+<h2>RTR → RTS</h2>
+
+<p>当 QP 进入 RTR 后，对端可以发送数据给本端。RTR→RTS 是最后一步，完成后 QP 可双向通信。</p>
+
+<h3>必需属性</h3>
+
+<table>
+<thead>
+<tr><th>属性标志</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>IBV_QP_STATE</code></td><td><code>IBV_QPS_RTS</code></td></tr>
+<tr><td><code>IBV_QP_SQ_PSN</code></td><td>本端 SQ 的起始发送 PSN。通常 = <code>local_psn</code>（代码中自选，如 0）。</td></tr>
+<tr><td><code>IBV_QP_TIMEOUT</code></td><td>本地 ACK 超时时间。指数编码：4.096 us × 2^timeout，推荐 14 (~67 ms)。</td></tr>
+<tr><td><code>IBV_QP_RETRY_CNT</code></td><td>重传次数上限（默认 7）。超过后 QP 进入 ERROR 状态。</td></tr>
+<tr><td><code>IBV_QP_RNR_RETRY</code></td><td>RNR NACK 重试次数上限（默认 7）。超过后 QP 进入 ERROR 状态。</td></tr>
+<tr><td><code>IBV_QP_MAX_QP_RD_ATOMIC</code></td><td>本端发起的未完成 RDMA READ/ATOMIC 请求数量上限。双方需协商设置。</td></tr>
+</tbody>
+</table>
+
+<pre><code>struct ibv_qp_attr attr = { 0 };
+attr.qp_state          = IBV_QPS_RTS;
+attr.sq_psn            = local_psn;       // 本端起始发送 PSN
+attr.timeout           = 14;              // ~67ms ACK 超时
+attr.retry_cnt         = 7;               // 最大重传次数
+attr.rnr_retry         = 7;               // 最大 RNR 重试次数
+attr.max_rd_atomic     = 1;               // 未完成 RDMA READ 数量
+
+ibv_modify_qp(qp, &attr,
+    IBV_QP_STATE | IBV_QP_SQ_PSN | IBV_QP_TIMEOUT |
+    IBV_QP_RETRY_CNT | IBV_QP_RNR_RETRY | IBV_QP_MAX_QP_RD_ATOMIC);</code></pre>
+
+<h3>RTS 参数说明</h3>
+
+<ul>
+<li><strong>TIMEOUT</strong>：等待 ACK 的最大时间。取值 = 4.096 us × 2^timeout。如果对端在该时间内未回复 ACK/NACK，本端认为丢包并重传。设置太小会导致不必要的重传（增加网络负载），太大则延迟了错误检测。</li>
+<li><strong>RETRY_CNT</strong>：非 RNR 错误的连续重试次数。耗尽后 QP → ERROR。发送方应设计合适的重试策略而非依赖硬件无限重试。</li>
+<li><strong>RNR_RETRY</strong>：对端返回 RNR NACK（对端 RQ 无 RECV WQE 匹配）的重试次数。超过后 QP → ERROR。高频应用需确保 RECV 补充速度 &gt; 对端发送速度，避免 RNR 耗尽。</li>
+<li><strong>Max RD Atomic</strong>：控制未完成 RDMA READ 的并发度，影响吞吐但也会占用 HCA 资源。</li>
+</ul>
+
+<h2>错误状态</h2>
+
+<p>以下情况会导致 QP 自动进入 ERROR 状态：</p>
+
+<ul>
+<li><strong>RNR 重试耗尽</strong> — 对端持续返回 RNR NACK（RQ 空）超过 <code>rnr_retry</code> 设置。</li>
+<li><strong>重传次数超限</strong> — ACK 超时后重传 <code>retry_cnt</code> 次仍未收到回复。</li>
+<li><strong>远程访问违规</strong> — RDMA WRITE/READ 的目标内存超出 MR 范围，或 rkey 权限不足。</li>
+<li><strong>保护错误</strong> — PD 不匹配、lkey 无效、本地访问违规。</li>
+<li><strong>接收缓冲区溢出</strong> — SEND 数据超过 RECV WQE 指定的缓冲区大小。</li>
+<li><strong>序列号错误</strong> — 收到的 PSN 与期望值不匹配。</li>
+</ul>
+
+<p>进入 ERROR 状态后：</p>
+<ul>
+<li>SQ 和 RQ 上所有未完成的 WR 被 <strong>flush</strong>，即直接在 CQ 中生成 <code>IBV_WC_WR_FLUSH_ERR</code> 状态。</li>
+<li>所有已 flush 的 WR 需要应用通过 <code>ibv_poll_cq()</code> 逐一出队。</li>
+<li>QP 无法直接回到 RTS。恢复路径为：ERROR → RESET → INIT → RTR → RTS。所有 WR 需重新 post。</li>
+</ul>
+
+<h2>Work Completion 语义</h2>
+
+<p>WC 是 RDMA 数据路径中最容易被误解的概念。Work Completion 表示一个 WR <strong>在本地侧已经完成</strong>，但它不代表远程数据已经被消费。</p>
+
+<h3>不同操作的 WC 行为</h3>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>操作</th><th>发起方 WC</th><th>目标方 WC</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>SEND</strong></td><td>收到 ACK 后出现 WC</td><td>数据写入 RECV 缓冲区后出现 WC</td></tr>
+<tr><td><strong>RECV</strong></td><td>—</td><td>SEND 到达且数据拷贝完成后出现 WC</td></tr>
+<tr><td><strong>RDMA WRITE</strong></td><td>收到 ACK 后出现 WC</td><td><strong>无 WC</strong>（除非使用 WRITE_WITH_IMM）</td></tr>
+<tr><td><strong>RDMA WRITE_WITH_IMM</strong></td><td>收到 ACK 后出现 WC</td><td>数据到达后，CQ 中出现 opcode=<code>IBV_WC_RECV_RDMA_WITH_IMM</code> 的 WC，<code>imm_data</code> 有效</td></tr>
+<tr><td><strong>RDMA READ</strong></td><td>对端数据 DMA 到本地缓冲区后出现 WC</td><td><strong>无 WC</strong>（读取操作完全透明）</td></tr>
+<tr><td><strong>ATOMIC</strong></td><td>原子操作完成后出现 WC，<code>wc.imm_data</code> 含原值</td><td>无 WC</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>WC 状态码</h3>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>状态码</th><th>含义</th></tr>
+</thead>
+<tbody>
+<tr><td><code>IBV_WC_SUCCESS</code></td><td>操作成功完成。</td></tr>
+<tr><td><code>IBV_WC_LOC_LEN_ERR</code></td><td>本地缓冲区长度不足（SEND 数据大于 RECV 缓冲区）。</td></tr>
+<tr><td><code>IBV_WC_LOC_QP_OP_ERR</code></td><td>QP 状态不允许该操作（如在 RTR 中尝试 SEND）。</td></tr>
+<tr><td><code>IBV_WC_LOC_PROT_ERR</code></td><td>保护错误（PD 不匹配、lkey 无效）。</td></tr>
+<tr><td><code>IBV_WC_WR_FLUSH_ERR</code></td><td>QP 进入 ERROR 状态后 WR 被强制完成。注意这不是网络错误，而是 QP 错误导致的 flush。</td></tr>
+<tr><td><code>IBV_WC_RETRY_EXC_ERR</code></td><td>重传次数超过 retry_cnt。对端可能不可达。</td></tr>
+<tr><td><code>IBV_WC_RNR_RETRY_EXC_ERR</code></td><td>RNR 重试次数超过 rnr_retry。对端进程可能来不及补充 RECV WQE。</td></tr>
+<tr><td><code>IBV_WC_REM_INV_REQ_ERR</code></td><td>对端报告请求无效（如非法 opcode）。</td></tr>
+<tr><td><code>IBV_WC_REM_ACCESS_ERR</code></td><td>对端报告远程访问违规（rkey 无效或越权）。</td></tr>
+<tr><td><code>IBV_WC_RESP_TIMEOUT_ERR</code></td><td>请求超时，对端无响应。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>常见误解</h2>
+
+<h3>"WC 到达意味着数据对端可见"</h3>
+<p>对于 SEND，发起方收到 WC（ACK 确认）意味着数据包已被对端 HCA 接收并写入内存。<strong>但不保证对端应用已经轮询到 WC 并读取了数据</strong>。对于 RDMA WRITE，发起方 WC 仅表示数据已到达对端 HCA 并被写入指定内存地址，<strong>对端应用可能尚未查看该内存区域</strong>。需要额外的带外同步（如 WRITE_WITH_IMM 或 fence）来保证可见性顺序。</p>
+
+<div class="callout note">
+<strong>内存可见性保证</strong>
+对于 RC QP，RDMA WRITE 完成（发起方收到 WC）提供了 <strong>强顺序保证</strong>：该 WRITE 之前的所有 WRITE 保证在对端内存可见。这类似 PCIe 的 write barrier。但不同 QP 之间的顺序由应用保证。
+</div>
+
+<h3>"WC SUCCESS 意味着没有错误"</h3>
+<p>WC 的 status 字段必须显式检查。即使 <code>ibv_poll_cq()</code> 返回一个 WC，其 status 也可能是非零的错误码。许多生产 bug 来源于应用忽略了 WC 状态码。</p>
+
+<pre><code>int n = ibv_poll_cq(cq, 1, &wc);
+if (n > 0) {
+    if (wc.status != IBV_WC_SUCCESS) {
+        fprintf(stderr, "CQ error: %s (opcode=%d)\n",
+                ibv_wc_status_str(wc.status), wc.opcode);
+        // 需要处理 flush 状态
+        if (wc.status == IBV_WC_WR_FLUSH_ERR) { /* QP 已损坏 */ }
+    }
+}</code></pre>
+
+<h3>"轮询 CQ 足够做流控"</h3>
+<p>CQ 中的 WC 只表示单个 WR 已完成，不表示对端已经处理了数据。在 SEND/RECV 模型中，发起方的 WC 不表示对端应用已处理数据，仅表示对端 HCA 写入了内存。做端到端流控需要使用应用层确认（app-level ACK）或者利用 WRITEWITH_IMM 的接收端 WC 做显式握手机制。</p>
+
+<h3>"QP 参数可以随时修改"</h3>
+<p>绝大多数 QP 属性（AH、MTU、重传参数等）只能在特定状态修改。例如 AH 和 destination QPN 只能在 RTR transition 时设置。SQ 相关参数只能在 SQD 状态下修改。运行时参数错误会直接导致 <code>ibv_modify_qp()</code> 返回 <code>EINVAL</code>。</p>
+
+<h3>"多 QP 共享同一 CQ 没有问题"</h3>
+<p>多 QP 共享 CQ 是允许的且在某些场景下有用，但要注意：WC 的 <code>qp_num</code> 字段标识了来源 QP。如果 CQ 深度不够且多个 QP 密集完成，CQ 溢出会导致所有相关 QP 的 WR 被 flush。建议为高吞吐 QP 分别分配 CQ。</p>
+
+<footer class="footer">
+  <nav><a href="02-verbs-object-lifecycle.html">← 上一页</a><a href="04-memory-registration-and-rkey.html">下一页 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

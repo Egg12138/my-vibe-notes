@@ -1,0 +1,238 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDMA 数据路径 — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html" class="active">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>RDMA 数据路径</h1>
+<p class="subtitle">从应用到 RNIC/Soft-RoCE 的完整数据搬运路径</p>
+
+<h2>分层模型</h2>
+
+<p>RDMA 数据路径从上层应用到物理网络共经过 5 层。理解每一层的边界和职责是掌握 RDMA 性能调优与故障排查的基础。</p>
+
+<div class="diagram">+-------------------------------------------------------------------+
+|  <span class="label">Application</span>  (用户进程, 调用 libibverbs / librdmacm)                |
+|  buffer = malloc(...); ibv_post_send(qp, &wr); ibv_poll_cq(cq, ...) |
++------+------------------------------------------------------------+
+       |  <span class="label">System Call</span>  (ioctl / write)  ——  uverbs 接口
++------+------------------------------------------------------------+
+|  <span class="label">User Library</span>  (libibverbs / provider: mlx5, rxe, bnxt_re)  |
+|  将 WR 序列化为 WQE 格式, 写入共享内存环形队列 (doorbell)        |
++------+------------------------------------------------------------+
+       |  <span class="label">uverbs</span>   ——  /dev/infiniband/uverbsX
++------+------------------------------------------------------------+
+|  <span class="label">Kernel RDMA Subsystem</span>  (ib_core / ib_uverbs / RXE / 厂商驱动) |
+|  对象管理, WQE 验证, DMA 映射, 网卡队列编程                        |
++------+------------------------------------------------------------+
+       |  <span class="label">PCIe / 内核网络栈</span>
++------+------------------------------------------------------------+
+|  <span class="label">RNIC / Soft-RoCE</span>  (硬件 HCA 或 RXE 内核模块)              |
+|  数据搬移: DMA (硬件) 或 memcpy (RXE), 分组化, 发送到网络         |
++------+------------------------------------------------------------+
+       |  <span class="label">物理层</span>  (IB Link / Ethernet PHY)
++------+------------------------------------------------------------+
+|  <span class="label">Network</span>  (InfiniBand fabric / Ethernet switch)              |
++-------------------------------------------------------------------+</div>
+
+<h3>各层职责</h3>
+
+<ol>
+<li><strong>Application</strong> — 运行在用户态的业务进程，分配缓冲区、通过 libibverbs 提交工作请求（WR）、轮询完成队列（CQ）获得操作完成通知。</li>
+<li><strong>User Library</strong> — libibverbs 根据选择的 provider（如 mlx5 针对 Mellanox/ConnectX 网卡，rxe 针对 Soft-RoCE）将 WR 格式化为硬件可识别的 WQE，通过内存映射的环形队列提交给内核/硬件。</li>
+<li><strong>uverbs</strong> — 用户态与内核态之间的控制通道。对象创建（QP、CQ、MR）等控制操作走 ioctl 或 write() 系统调用进入内核。数据路径（post_send / post_recv）走共享内存 + doorbell 机制，避免上下文切换。</li>
+<li><strong>Kernel RDMA Subsystem</strong> — 内核中的 <code>ib_core</code> 模块管理所有 RDMA 对象。RXE 模块在此层完成软件数据拷贝。硬件厂商（mlx5、bnxt_re、irdma）的驱动负责直接编程 HCA。</li>
+<li><strong>RNIC / Soft-RoCE</strong> — 数据的最终搬运者。硬件 RNIC 使用 DMA 引擎直接读写主机内存。RXE 使用 <code>skb</code> 走 Linux 内核网络栈发送数据。</li>
+</ol>
+
+<h2>控制面 vs 数据面</h2>
+
+<p>RDMA 架构将控制面和数据面清晰分离，这是它实现高吞吐低延迟的关键设计之一。</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>方面</th><th>控制面 (Control Path)</th><th>数据面 (Data Path)</th></tr>
+</thead>
+<tbody>
+<tr><td>典型调用</td><td><code>ibv_alloc_pd()</code>, <code>ibv_create_qp()</code>, <code>ibv_modify_qp()</code>, <code>ibv_reg_mr()</code></td><td><code>ibv_post_send()</code>, <code>ibv_post_recv()</code>, <code>ibv_poll_cq()</code></td></tr>
+<tr><td>频率</td><td>低频，建立连接时执行</td><td>高频，每个消息的执行路径</td></tr>
+<tr><td>延迟敏感度</td><td>低（ms 级别可以接受）</td><td>极高（us / ns 级别）</td></tr>
+<tr><td>系统调用</td><td>每次都经过系统调用</td><td>通过 MMIO doorbell 避免系统调用</td></tr>
+<tr><td>CPU 开销</td><td>对象管理开销，可忽略</td><td>直接决定应用性能上限</td></tr>
+<tr><td>依赖资源</td><td>内核对象、锁、内存分配</td><td>DMA 引擎、PCIe 带宽、内存带宽</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout note">
+<strong>关键设计</strong>
+数据面通过 <code>mmap</code> 将 HCA 的 doorbell 寄存器映射到用户空间，post_send 直接对 MMIO 区域写入即可触发网卡执行 DMA 读取 WQE。整个过程 <strong>零系统调用</strong>。
+</div>
+
+<h2>发送路径 (SEND)</h2>
+
+<p>应用通过 <code>ibv_post_send()</code> 提交 SEND WR 的完整执行流程：</p>
+
+<ol>
+<li><strong>准备缓冲区</strong> — 应用填充数据到已注册的 MR 缓冲区，构造 <code>ibv_send_wr</code> 结构体，设置 opcode 为 <code>IBV_WR_SEND</code>，指定 sg_list 和 num_sge。</li>
+<li><strong>提交 WR</strong> — <code>ibv_post_send(qp, &wr, &bad_wr)</code> 被调用。在用户态，libibverbs 将 <code>ibv_send_wr</code> 转换为硬件 WQE 格式，写入 SQ 的共享内存环形缓冲区。最后写入 doorbell 寄存器通知 HCA 有新 WQE 可达。</li>
+<li><strong>HCA 拾取 WQE</strong> — RNIC 检测到 doorbell，通过 DMA 从主机内存读取 WQE。对于 inline 发送，数据直接从 WQE 中读取；否则 HCA 需发起额外 DMA 读取数据缓冲区。</li>
+<li><strong>分组化</strong> — HCA 将数据切分为 MTU 大小的包，添加 BTH、RETH（如果是 RDMA WRITE）等传输头。对于 RoCEv2，封装为 UDP/IP 包（目标端口 4791）。</li>
+<li><strong>发送到网络</strong> — 物理层通过 IB link 或以太网 PHY 将数据包发送到网络中。</li>
+<li><strong>完成通知</strong> — 数据被确认后（对 RC），或发出后（对 UD），HCA 将 WC 写回主机内存 CQ 中，并可选触发 MSI-X 中断。</li>
+<li><strong>应用轮询</strong> — <code>ibv_poll_cq(cq, num_entries, wc)</code> 从 CQ 中取出 WC，检查 status 字段确认结果。</li>
+</ol>
+
+<h3>Soft-RoCE 发送差异</h3>
+
+<p>RXE 没有 DMA 引擎。当用户态调用 <code>ibv_post_send()</code> 时，WQE 通过 uverbs 系统调用进入内核。RXE 内核模块读取 WQE，通过 <code>skb</code> 和内核网络栈（通常是 UDP socket）将数据发出。数据的 <code>memcpy</code> 由内核 CPU 完成。</p>
+
+<h2>接收路径 (RECV)</h2>
+
+<ol>
+<li><strong>预提交 RECV WR</strong> — 应用在通信开始前调用 <code>ibv_post_recv(qp, &wr, &bad_wr)</code> 将空缓冲区提交到 RQ。WQE 被推到硬件 RQ 环形缓冲区。</li>
+<li><strong>数据包到达</strong> — RNIC 从网络收到数据包，解析 BTH 获取 destination QPN。根据 QPN 找到对应 QP。</li>
+<li><strong>匹配 WQE</strong> — HCA 从 RQ 头取一个 WQE（或由 SRQ 分配），对比数据包长度与 WQE 描述缓冲区大小。</li>
+<li><strong>DMA 传输数据</strong> — RNIC 通过 DMA 将 payload 写入 WQE 指定的 MR 缓冲区（使用 MR 的物理地址列表 PBL）。</li>
+<li><strong>生成 WC</strong> — HCA 将完成信息（opcode = <code>IBV_WC_RECV</code>, byte_len, src_qp, imm_data 等）写入 CQ。</li>
+<li><strong>应用获取数据</strong> — 应用轮询 <code>ibv_poll_cq()</code> 获得 WC，使用 byte_len 判断实际收到数据量。处理完成后重新 post RECV 到 RQ。</li>
+</ol>
+
+<div class="callout warn">
+<strong>常见陷阱</strong>
+接收端必须 <strong>在数据包到达前</strong> 预提交 RECV WR。如果 RQ 为空，到达的 SEND 包会被 HCA 丢弃（RC 会重传，UC/UD 会静默丢失）。RQ 深度和 RECV 补充速度直接决定吞吐上限。
+</div>
+
+<h2>RDMA 单边路径 (WRITE)</h2>
+
+<p>RDMA WRITE 体现了 RDMA "远程直接内存访问" 的核心价值：完全不涉及对端 CPU。</p>
+
+<ol>
+<li><strong>发起方</strong> 构造 <code>ibv_send_wr</code>，opcode 设为 <code>IBV_WR_RDMA_WRITE</code>，指定：
+  <ul>
+    <li>本地缓冲区 (sge.addr, sge.length) — 数据源</li>
+    <li>对端虚拟地址 (wr.rdma.remote_addr) — 数据目的地</li>
+    <li>对端 rkey (wr.rdma.rkey) — 远程访问凭证</li>
+  </ul>
+</li>
+<li>HCA 收到 WQE 后：读取本地数据 → 构造包含 RETH 的数据包 → 通过 RoCEv2/UDP 发送到对端。</li>
+<li><strong>对端 HCA</strong> 收到包后，验证 RETH 中的 rkey 是否有权写入该内存区域。验证通过后，<strong>对端 HCA 直接将 payload DMA 写入 host memory</strong>，无需对端 CPU 介入。</li>
+<li><strong>完成</strong> — 数据到达对端内存后，对端 HCA 发回 ACK。发起方 HCA 收到 ACK 后生成 WC。对端无 WC（除非使用 WRITE_WITH_IMM）。</li>
+</ol>
+
+<div class="callout note">
+<strong>性能含义</strong>
+单边操作消除了对端 CPU 的数据搬运开销。在存储场景（NVMe-oF）、AI 训练（NCCL）中，RDMA WRITE/READ 是 main path。但发起方需要知道对端的内存地址和 rkey，这通常需要通过带外通道（如 TCP 控制消息）预先交换。
+</div>
+
+<h2>Soft-RoCE 特殊性</h2>
+
+<p>Soft-RoCE (RXE) 是一个纯内核软件实现的 RDMA 数据路径。它与硬件 RNIC 有本质差异：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>特性</th><th>硬件 RNIC</th><th>Soft-RoCE (RXE)</th></tr>
+</thead>
+<tbody>
+<tr><td>数据搬移</td><td>DMA 引擎，独立于 CPU</td><td>内核 <code>memcpy()</code>，占用 CPU 周期</td></tr>
+<tr><td>PCIe 带宽</td><td>通过 PCIe 访问内存</td><td>不需要 PCIe，但受内存带宽限制</td></tr>
+<tr><td>CPU 卸载</td><td>完全卸载</td><td>CPU 做所有工作（数据拷贝 + 协议处理）</td></tr>
+<tr><td>延迟</td><td>1-3 us</td><td>10-50 us（取决于速率）</td></tr>
+<tr><td>数据面系统调用</td><td>无（MMIO doorbell）</td><td>每次 post_send 需系统调用</td></tr>
+<tr><td>多队列</td><td>硬件多队列，MSI-X 均衡</td><td>单队列，或由内核调度分担</td></tr>
+<tr><td>适用场景</td><td>生产环境，低延迟要求</td><td>学习、开发、测试、原型验证</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>RXE 数据路径的内部流程</h3>
+
+<p>当 RXE 作为 provider 时，<code>ibv_post_send()</code> 的用户态调用将通过 <code>write()</code> 系统调用进入内核。RXE 内核模块获取 WQE 后：</p>
+
+<ol>
+<li>解析 WQE 中的 opcode、sge 列表等字段</li>
+<li>读取用户态缓冲区（通过 <code>copy_from_user</code> 或 <code>get_user_pages_fast</code>）</li>
+<li>根据 opcode 调用对应的处理函数（<code>rxe_send()</code>, <code>rxe_rdma_write()</code> 等）</li>
+<li>构造 <code>sk_buff</code>，填充 BTH、RETH、IETH 等头部</li>
+<li>通过内核 UDP socket 发送 <code>skb</code>（RoCEv2 UDP/4791）</li>
+<li>对端 RXE 实例通过 UDP socket 接收包，解析头部，拷贝数据到目标 MR 的缓冲区，生成 CQ entry</li>
+</ol>
+
+<div class="callout warn">
+<strong>RXE 性能边界</strong>
+RXE 的数据路径 BW 上限取决于主机内存带宽和 CPU 频率，而非网络接口速率。例如，单核 3GHz CPU 的 <code>memcpy</code> 吞吐约 6-8 GB/s，这即为 RXE 的理论极限。多核也可线性扩展但受内核内存架构（NUMA）限制。SSD 或高速网络场景不要依赖 RXE 做基准。
+</div>
+
+<h2>数据流全景图</h2>
+
+<p>以下示意了 SEND + RDMA WRITE 两种操作在数据路径上的区别：</p>
+
+<div class="diagram">                    SEND                              RDMA WRITE
+                    ======                            ===========
+   App A                          App B              App A                     App B
+    |                               |                 |                          |
+    v                               ^                 |                          |
+  [post_send]                       |                 |  [post_send]             |
+    |  \                            |                 |    |                     |
+    |   +-- WQE -------> [HCA DMA]  |                 |    +-- WQE               |
+    |                   read buf    |                 |        |                  |
+    |                   packetize --+---wire---+      |   [HCA DMA read buf]      |
+    |                               |          |      |        |                  |
+    |                    [HCA DMA]<-+---wire---+      |   [UDP/IP packet]  --+---wire---+
+    |                     write buf |                 |                      |          |
+    v                               v                 |           [HCA DMA write buf]    |
+  [poll_cq] <-- WC <-- [CQ]      [CQ] <-- WC         |                      |          |
+    |                               ^                 |           (rkey check passed)    |
+    |                          [post_recv]            |                      |          |
+    |                               |                 v                      v          |
+   CPU involved                   CPU involved     [poll_cq] <-- WC       no WC         |
+                                                     |                      (no CPU!)
+                                                    CPU involved          CPU not involved</div>
+
+<footer class="footer">
+  <nav><a href="00-glossary.html">← 上一页</a><a href="02-verbs-object-lifecycle.html">下一页 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

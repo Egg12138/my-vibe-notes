@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第二课 · 设备发现与环境建立 — RDMA 课程</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 课程课件</a></h2>
+  <nav>
+    <div class="section-label">课时</div>
+    <ul>
+      <li><a href="0001-dma-to-rdma.html">01 · 从 DMA 到 RDMA</a></li>
+      <li><a href="0002-device-and-env.html" class="active">02 · 设备发现与环境</a></li>
+      <li><a href="0003-core-objects.html">03 · 核心对象模型</a></li>
+      <li><a href="0004-data-path.html">04 · 数据路径深入</a></li>
+      <li><a href="0005-connection-models.html">05 · 连接模型</a></li>
+      <li><a href="0006-to-production.html">06 · 走向生产</a></li>
+    </ul>
+    <div class="section-label">参考</div>
+    <ul>
+      <li><a href="../reference/lab-guide.html">实验指导</a></li>
+      <li><a href="../reference/index.html">参考讲义</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>第二课 · 设备发现与环境建立</h1>
+<p class="subtitle">学习发现 RDMA 设备、查询属性、配置 Soft-RoCE，并用 rping 完成第一次 RDMA 通信</p>
+
+<h2>RDMA 设备发现流程</h2>
+
+<p>在开始任何 RDMA 编程之前，首先需要找到系统中的 RDMA 设备。这就像在 socket 编程中调用 <code>getaddrinfo()</code> 之前需要知道网卡名称一样。RDMA 的设备发现通过 libibverbs 提供的一组函数完成：</p>
+
+<ol>
+  <li><strong><code>ibv_get_device_list()</code></strong> — 枚举系统中所有可用的 RDMA 设备，返回一个 <code>ibv_device</code> 数组</li>
+  <li><strong><code>ibv_open_device()</code></strong> — 打开一个指定的 RDMA 设备，获得 <code>ibv_context</code> 句柄</li>
+  <li><strong><code>ibv_query_device()</code></strong> — 查询设备属性，包括固件版本、节点 GUID、最大 QP/CQ/MR 数量等</li>
+  <li><strong><code>ibv_query_port()</code></strong> — 查询端口属性：状态（ACTIVE/DOWN）、LID、MTU、活跃速率等</li>
+</ol>
+
+<p>设备发现完成后，<code>ibv_context</code> 是你与硬件交互的根句柄——几乎所有后续对象（PD、MR、CQ、QP）都直接或间接从它派生。</p>
+
+<div class="callout note">
+<strong>关键 API</strong>
+<code>ibv_get_device_list</code> 返回的列表包含了系统中所有注册到 RDMA 核心框架的设备，包括物理 RNIC 和 Soft-RoCE 接口。区分它们可以通过设备名称前缀：<code>mlx5</code>（Mellanox）、<code>rxe</code>（Soft-RoCE）、<code>irdma</code>（Intel）等。
+</div>
+
+<h2>设备信息详解</h2>
+
+<p>通过 <code>ibv_devinfo</code> 命令行工具可以快速查看设备信息。以下是一个典型的 Soft-RoCE 设备输出：</p>
+
+<pre>hca_id:  rxe0
+    transport:          InfiniBand (0)
+    fw_ver:             0.0.0
+    node_guid:          02:00:00:11:22:33:44:55
+    sys_image_guid:     02:00:00:11:22:33:44:55
+    vendor_id:          0x02c9
+    vendor_part_id:     1
+    hw_ver:             0
+    board_id:           None
+    phys_port_count:    1
+
+    port:    1
+        state:              PORT_ACTIVE (4)
+        max_mtu:            4096 (5)
+        active_mtu:         1024 (3)
+        sm_lid:             0
+        port_lid:           0
+        port_lmc:           0x00
+        link_layer:         Ethernet</pre>
+
+<p>需要关注的关键字段：</p>
+<ul>
+  <li><strong>hca_id</strong> — 设备名称，在编程中用作设备标识</li>
+  <li><strong>transport</strong> — 传输类型，Soft-RoCE 显示为 InfiniBand（因为 Verbs 层统一抽象为 IB 语义）</li>
+  <li><strong>node_guid</strong> — 64 位全局唯一标识符，类似于 MAC 地址但在 RDMA 域中使用</li>
+  <li><strong>phys_port_count</strong> — 物理端口数量，大多数单口设备为 1</li>
+  <li><strong>state</strong> — <code>PORT_ACTIVE</code> 表示链路正常，<code>PORT_DOWN</code> 表示链路未连接</li>
+  <li><strong>link_layer</strong> — 链路层类型，RoCE/RXE 为 Ethernet，InfiniBand 硬件为 InfiniBand</li>
+</ul>
+
+<h2>GID 概念</h2>
+
+<p>GID（Global Identifier）是 RDMA 网络中的地址标识符。它的作用类似于 IP 地址，但在 RDMA 协议栈中有更丰富的含义。</p>
+
+<p>对于 InfiniBand：GID 是一个 128 位的 IPv6-like 地址，由 subnet prefix（64 位）和 node GUID（64 位）拼接而成。</p>
+
+<p>对于 RoCEv2：GID 实际上就是网卡的 IP 地址。由于 RoCEv2 使用 UDP/IP 封装，GID 表中通常包含网卡上配置的 IPv4 地址（以 IPv4-mapped IPv6 格式表示，如 <code>::ffff:10.0.2.15</code>）。</p>
+
+<p>每个端口可以有多个 GID（属于不同的 GID Index），因为一个网卡可能配置了多个 IP 地址。在连接建立时，通信双方需要交换各自的 GID 信息。</p>
+
+<pre>$ rdma link show
+link rxe0/1 state ACTIVE physical_state LINK_UP net_dev eth0
+
+$ rdma dev show
+0: rxe0: node_guid 02:00:00:11:22:33:44:55 sys_image_guid 02:00:00:11:22:33:44:55</pre>
+
+<h2>Soft-RoCE 环境配置</h2>
+
+<p>在 Linux 上启用 Soft-RoCE 只需要两个步骤：</p>
+
+<ol>
+  <li><strong>加载内核模块</strong>：<code>modprobe rdma_rxe</code></li>
+  <li><strong>绑定网络接口</strong>：<code>rdma link add rxe0 type rxe netdev eth0</code></li>
+</ol>
+
+<p>其中 <code>eth0</code> 是你希望 RXE 绑定到的物理或虚拟网络接口。绑定后，<code>rxe0</code> 作为一个 RDMA 设备出现在系统中，对 libibverbs 可见。</p>
+
+<div class="callout warn">
+<strong>注意事项</strong>
+如果 RXE 绑定到 <code>lo</code>（loopback），两台虚拟机互相通信时需要在各自的非 lo 接口上绑定 RXE。在 QEMU 实验环境中，通常使用虚拟网卡（如 <code>enp0s1</code>）绑定 RXE。
+</div>
+
+<h2>设备节点与文件系统接口</h2>
+
+<p>RDMA 设备在内核中有三个可见层面的接口：</p>
+
+<ul>
+  <li><strong>/dev/infiniband/uverbs0</strong> — 用户态字符设备。libibverbs 通过 <code>ioctl</code> 和 <code>mmap</code> 与内核交互</li>
+  <li><strong>/sys/class/infiniband/*</strong> — sysfs 接口，可查看设备型号、固件版本、端口状态等</li>
+  <li><strong>/sys/class/net/*/device/infiniband/</strong> — 通过网络设备查找绑定的 RDMA 设备（对 RXE 适用）</li>
+</ul>
+
+<pre>$ ls /dev/infiniband/
+uverbs0
+
+$ cat /sys/class/infiniband/rxe0/node_desc
+rxe0
+
+$ ls /sys/class/infiniband/rxe0/ports/1/
+gids/   lid     link_layer     phys_state     rate
+gid_attrs/    lm     capability_mask    pkeys/      sm_lid     state
+     subnet_timeout</pre>
+
+<h2>第一个 RDMA 通信测试：rping</h2>
+
+<p><code>rping</code> 是 librdmacm 包中的一个测试工具，功能等同于 RDMA 世界的 ping——它验证两台机器之间能否通过 RDMA 建立连接并交换数据。</p>
+
+<p>在两台配置了 Soft-RoCE 的机器（或两虚拟机）之间运行：</p>
+
+<p><strong>服务端（IP 10.0.2.7）：</strong></p>
+<pre># rping -s -a 10.0.2.7 -v</pre>
+
+<p><strong>客户端（连接 10.0.2.7）：</strong></p>
+<pre># rping -c -a 10.0.2.7 -v -C 5</pre>
+
+<p><code>-v</code> 表示 verbose，<code>-C 5</code> 表示发送 5 次 ping。如果一切正常，你将看到类似以下的输出：</p>
+
+<pre>ping data: rdma-ping-0: bytes = 1024
+ping data: rdma-ping-1: bytes = 1024
+ping data: rdma-ping-2: bytes = 1024
+ping data: rdma-ping-3: bytes = 1024
+ping data: rdma-ping-4: bytes = 1024
+rping: ping latency: min: 0.257, max 0.853, avg 0.470</pre>
+
+<p>延迟以毫秒为单位。Soft-RoCE 的延迟通常在 0.2~1ms 之间（取决于虚拟机配置），远高于硬件 RNIC 的 1~3us，但作为学习验证完全足够。</p>
+
+<h2>rping 内部做了什么？</h2>
+
+<p>虽然 rping 只是一个简单的测试工具，但它的内部流程展示了 RDMA 应用的基本骨架：</p>
+
+<ol>
+  <li>创建 CM ID（<code>rdma_create_id</code>）</li>
+  <li>解析地址（<code>rdma_resolve_addr</code>）— DNS 或直接 IP 解析</li>
+  <li>解析路由（<code>rdma_resolve_route</code>）</li>
+  <li>创建 QP（在 CM 回调中自动完成）</li>
+  <li>连接（<code>rdma_connect</code> / <code>rdma_accept</code>）</li>
+  <li>发送 ping 数据（<code>rdma_post_send</code> 或 <code>ibv_post_send</code>）</li>
+  <li>等待完成并计算 RTT</li>
+  <li>断开连接并清理资源</li>
+</ol>
+
+<div class="callout">
+<strong>学习路线图</strong>
+rping 的内部隐藏了大量细节。下一课我们将揭开面纱，深入理解 QP、CQ、MR、PD 等核心对象在 RDMA 编程模型中的角色。你现在已经看到了数据流动的起点。
+</div>
+
+<footer class="footer">
+  <nav><a href="0001-dma-to-rdma.html">← 上一课</a><a href="index.html">课时列表</a><a href="0003-core-objects.html">下一课 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

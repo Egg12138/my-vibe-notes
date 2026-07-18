@@ -1,0 +1,437 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>实验指导说明 — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html" class="active">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>实验指导说明</h1>
+<p class="subtitle">如何搭建环境、运行实验、使用提示系统与调试工具</p>
+
+<h2>实验架构概览</h2>
+
+<p>全部六个实验在一组双 QEMU x86_64 虚拟机上进行，两台虚拟机通过独立的虚拟以太网链路互连，每台虚拟机内部通过 <strong>Soft-RoCE (RXE)</strong> 将普通网卡暴露为 RDMA 设备：</p>
+
+<div class="diagram">+------------------------------------------------------------------+
+|  <span class="label">Host (WSL2 / Linux)</span>                                       |
+|                                                                  |
+|  +-------------+          +-------------+                        |
+|  | Guest 1     |          | Guest 2     |                        |
+|  | (server)    |          | (client)    |                        |
+|  |             |          |             |                        |
+|  | rdma link   |          | rdma link   |                        |
+|  | rxe0 type   |          | rxe0 type   |                        |
+|  | rxe netdev  |          | rxe netdev  |                        |
+|  | eth0        |          | eth0        |                        |
+|  |             |          |             |                        |
+|  | 192.168.    |          | 192.168.    |                        |
+|  | 100.1/24    |          | 100.2/24    |                        |
+|  +------+------+          +------+------+                        |
+|         |                       |                                |
+|         |  QEMU TCG (no KVM)    |                                |
+|         +-----------------------+                                |
++------------------------------------------------------------------+
+</div>
+
+<div class="callout note">
+  <strong>为什么需要两台虚拟机？</strong>
+  RDMA 的"R"代表 Remote。SPD/RECV、RDMA WRITE/READ 等操作要求两端有独立的 RDMA 设备，单机上无法完成。
+  Soft-RoCE 将内核网络栈模拟为 RNIC，因此可以在无真实硬件的环境中运行标准的 verbs 程序。
+</div>
+
+<p>每个实验都遵循相同的工作流程：</p>
+
+<ol>
+  <li><strong>先预测</strong>：阅读 README 和前置知识后，在 <code>starter/</code> 中写下对现象的预测</li>
+  <li><strong>启动环境</strong>：<code>make lab-up LAB=NN</code> 启动双 guest 虚拟机</li>
+  <li><strong>观察或实现</strong>：运行工具命令观察现象，或完成 starter 中的代码</li>
+  <li><strong>验证</strong>：<code>make verify LAB=NN</code> 运行自动验收</li>
+  <li><strong>制造故障</strong>：按实验要求主动引入错误，记录结果</li>
+  <li><strong>反思</strong>：回答 <code>reflection.md</code> 中的问题，写下结论</li>
+  <li><strong>关闭环境</strong>：<code>make lab-down</code> 停止并清理虚拟机</li>
+</ol>
+
+<h2>环境准备</h2>
+
+<p>课程在无 RNIC、无 KVM 的 WSL2 Ubuntu 24.04 上设计，TCG 模式运行 QEMU。</p>
+
+<h3>系统依赖</h3>
+
+<p>宿主机需要以下工具（<code>make env-check</code> 会自动检查）：</p>
+
+<h4>必选工具</h4>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>工具</th><th>验证方式</th><th>安装命令</th></tr>
+</thead>
+<tbody>
+<tr><td>cmake / ctest</td><td><code>cmake --version</code></td><td><code>sudo apt install cmake</code></td></tr>
+<tr><td>gcc / make</td><td><code>gcc --version</code></td><td><code>sudo apt install build-essential</code></td></tr>
+<tr><td>pkg-config</td><td><code>pkg-config --version</code></td><td><code>sudo apt install pkg-config</code></td></tr>
+<tr><td>qemu-system-x86_64</td><td><code>qemu-system-x86_64 --version</code></td><td><code>sudo apt install qemu-system-x86</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h4>可选工具（部分实验需要）</h4>
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>工具</th><th>用于</th><th>安装方式</th></tr>
+</thead>
+<tbody>
+<tr><td>rdma / ibv_devices</td><td>实验 00 设备检查</td><td><code>apt install rdma-core ibverbs-utils</code></td></tr>
+<tr><td>rping</td><td>实验 00 CM 连通性测试</td><td><code>apt install librdmacm-utils</code></td></tr>
+<tr><td>tcpdump</td><td>实验 00/04 捕获 RoCE 流量</td><td><code>apt install tcpdump</code></td></tr>
+<tr><td>perf</td><td>实验 04 CPU 性能计数</td><td><code>apt install linux-tools-generic</code></td></tr>
+<tr><td>taskset</td><td>实验 04 CPU 亲和性</td><td><code>apt install util-linux</code></td></tr>
+<tr><td>fi_info</td><td>实验 05 provider 发现</td><td><code>apt install libfabric-bin</code></td></tr>
+<tr><td>fi_pingpong</td><td>实验 05 抽象层验证</td><td><code>apt install libfabric-bin</code></td></tr>
+<tr><td>ucx_info</td><td>实验 05 UCX transport</td><td><code>apt install ucx-utils</code></td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>内核构建</h3>
+
+<p>guest 使用的 Linux 内核需要开启 RDMA 和 Soft-RoCE 支持。内核已预构建（v7.1-rc4），如需手动构建：</p>
+
+<pre><code># 设置内核源码路径（versions.lock 中锁定）
+export RDMA_COURSE_KERNEL_SOURCE=/path/to/linux
+
+# 构建内核
+sh scripts/build-kernel.sh
+
+# 产物位于 vm/out/kernel/
+#   bzImage       — 可引导内核镜像
+#   kernel.config — 实际使用的 .config
+#   manifest.lock — 提交和校验和记录
+</code></pre>
+
+<p>内核配置包含以下关键选项（<code>vm/kernel/required.config</code>）：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>配置</th><th>作用</th></tr>
+</thead>
+<tbody>
+<tr><td><code>CONFIG_INFINIBAND=y</code></td><td>内核 RDMA 子系统核心</td></tr>
+<tr><td><code>CONFIG_INFINIBAND_USER_ACCESS=y</code></td><td>用户态 uverbs ABI（<code>/dev/infiniband/uverbs0</code>）</td></tr>
+<tr><td><code>CONFIG_INFINIBAND_ADDR_TRANS=y</code></td><td>RDMA 地址转换 / CM 支持</td></tr>
+<tr><td><code>CONFIG_RDMA_RXE=y</code></td><td>Soft-RoCE RXE 驱动</td></tr>
+<tr><td><code>CONFIG_VIRTIO_NET=y</code></td><td>QEMU virtio 虚拟网卡</td></tr>
+<tr><td><code>CONFIG_VIRTIO_BLK=y</code></td><td>QEMU virtio 虚拟块设备</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>根文件系统构建</h3>
+
+<p>使用 debootstrap 创建 Ubuntu Noble (24.04) ext4 镜像，已包含 rdma-core、perftest、libfabric 等工具：</p>
+
+<pre><code># 构建 rootfs（需要 sudo，因为 debootstrap 需要 root）
+sudo sh scripts/build-rootfs.sh
+
+# 产物位于 vm/out/rootfs/
+#   rdma-course.ext4          — 4 GiB ext4 根文件系统镜像
+#   rdma-course.ext4.sha256   — 校验和
+#   rdma-course.ext4.packages.lock — 已安装包版本清单
+</code></pre>
+
+<p>rootfs 预装以下关键软件包：</p>
+<ul>
+  <li><strong>RDMA 用户态</strong>: rdma-core, ibverbs-utils, librdmacm-utils</li>
+  <li><strong>开发头文件</strong>: libibverbs-dev, librdmacm-dev</li>
+  <li><strong>基准测试</strong>: perftest</li>
+  <li><strong>生产抽象</strong>: libfabric-bin, libfabric-dev, ucx-utils</li>
+  <li><strong>系统工具</strong>: build-essential, cmake, tcpdump, strace, jq</li>
+  <li><strong>性能分析</strong>: linux-tools-generic, numactl</li>
+</ul>
+
+<h2>命令行操作指南</h2>
+
+<p>课程 Makefile 提供以下统⼀命令。所有命令在仓库根目录下执行。</p>
+
+<h3>环境检查</h3>
+
+<pre><code>make env-check
+# 输出示例：
+# required  cmake                     ok
+# required  qemu-system-x86_64        ok
+# optional  ibv_devices               ok
+# optional  rping                     missing
+# capability kvm                       missing
+# capability rdma-device               missing
+# summary   required                  ok
+</code></pre>
+
+<p><code>required.missing</code> 表示缺少必选工具，运行实验前需要安装。<code>optional.missing</code> 仅在相关实验中产生影响。KVM 和 RDMA 设备缺失是正常现象（本课程设计为 TCG + Soft-RoCE）。</p>
+
+<h3>虚拟机生命周期</h3>
+
+<pre><code># 启动双 guest（实验 NN）
+make lab-up LAB=00
+
+# 停止所有 guest
+make lab-down
+
+# lab-up 执行以下步骤：
+#   1. 启动 guest1（服务端）：前台的 QEMU 实例
+#   2. 等待 guest1 启动完成（串口登录检测）
+#   3. 在 guest1 内部配置 IP、创建 RXE、启动服务端程序
+#   4. 启动 guest2（客户端）
+#   5. 在 guest2 内部配置 IP、创建 RXE
+# lab-down 执行以下步骤：
+#   1. 停止两台 guest 中的用户程序
+#   2. 向 QEMU 进程发送 shutdown 或 kill 信号
+#   3. 恢复宿主机网络
+</code></pre>
+
+<h3>验证实验</h3>
+
+<pre><code># 验证单个实验
+make verify LAB=01
+
+# 验证全部实验（含 host 单元测试）
+make verify-all
+</code></pre>
+
+<p>验证脚本检查 starter 代码是否已完成（无 TODO 残留），然后根据实验类型验证。未完成实验输出明确的 TODO 诊断而不是无说明的编译错误。</p>
+
+<h3>获取提示</h3>
+
+<pre><code># 三级提示系统
+make hint LAB=01 LEVEL=1   # 概念提示
+make hint LAB=02 LEVEL=2   # API / 伪代码提示
+make hint LAB=03 LEVEL=3   # 局部代码形状 + 诊断命令
+
+# 提示逐级开放，建议先完成自己能完成的部分，遇到具体障碍再按需查看
+</code></pre>
+
+<div class="callout note">
+  <strong>提示使用建议</strong>：
+  0 级提示（你的先验知识 + README）永远是最重要的。Level 1 在卡住 15 分钟后再看；
+  Level 2 在实验核心逻辑无法推进时再看；Level 3 只在排错调试阶段参考，不应直接复制。
+</div>
+
+<h2>实验目录结构</h2>
+
+<p>每个实验的目录遵循统一契约。以 <code>labs/01-verbs-send-recv/</code> 为例：</p>
+
+<pre><code>labs/01-verbs-send-recv/
+├── README.md          # 场景、前置知识、任务、禁止事项、验收命令
+├── starter/           # 学习者需要修改的代码骨架 + CMakeLists.txt
+│   ├── CMakeLists.txt
+│   └── pingpong.c
+├── tests/             # 自动验收脚本
+│   └── verify.sh
+├── hints/             # 三级提示
+│   ├── 01.md          # Level 1: 概念提示
+│   ├── 02.md          # Level 2: API 序列 / 伪代码
+│   └── 03.md          # Level 3: 局部代码 + 诊断命令
+├── expected/          # 输出格式 / 协议不变量，不含完整答案
+│   └── protocol.schema.md
+└── reflection.md      # 3-5 个反思问题
+</code></pre>
+
+<h2>实验对照表</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>编号</th><th>名称</th><th>核心问题</th><th>最终产物</th><th>参考讲义</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td>00</td>
+  <td><a href="../labs/00-stack-observation/README.md">栈观察</a></td>
+  <td>RDMA 栈到底由什么组成？</td>
+  <td>环境诊断报告与数据路径图</td>
+  <td><a href="00-glossary.html">术语表</a>、<a href="01-rdma-data-path.html">数据路径</a></td>
+</tr>
+<tr>
+  <td>01</td>
+  <td><a href="../labs/01-verbs-send-recv/README.md">RC SEND/RECV</a></td>
+  <td>双边消息如何经过 QP/CQ？</td>
+  <td>可工作的 RC ping-pong</td>
+  <td><a href="02-verbs-object-lifecycle.html">Verbs 生命周期</a>、<a href="03-qp-state-and-completion.html">QP 状态机</a></td>
+</tr>
+<tr>
+  <td>02</td>
+  <td><a href="../labs/02-one-sided-rma/README.md">单边 RMA</a></td>
+  <td>单边访问如何做到，权限边界在哪</td>
+  <td>远端 mailbox 与权限故障实验</td>
+  <td><a href="04-memory-registration-and-rkey.html">内存注册与 rkey</a></td>
+</tr>
+<tr>
+  <td>03</td>
+  <td><a href="../labs/03-rdma-cm/README.md">RDMA CM</a></td>
+  <td>连接与失败应如何工程化管理</td>
+  <td>异步 CM 版客户端/服务端</td>
+  <td><a href="05-rdma-cm-state-machine.html">CM 状态机</a></td>
+</tr>
+<tr>
+  <td>04</td>
+  <td><a href="../labs/04-performance/README.md">性能测量</a></td>
+  <td>怎样正确测量和解释 RDMA？</td>
+  <td>可复现 benchmark 报告</td>
+  <td><a href="06-performance-methodology.html">性能方法论</a></td>
+</tr>
+<tr>
+  <td>05</td>
+  <td><a href="../labs/05-libfabric-service/README.md">libfabric 服务</a></td>
+  <td>生产应用为何通常不直接写 raw verbs</td>
+  <td>可切换 provider 的小型服务</td>
+  <td><a href="07-production-ecosystem.html">生产生态</a></td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<h2>学习闭环</h2>
+
+<p>每个实验强制形成以下反馈回路，这是本课程最核心的学习方法论：</p>
+
+<div class="diagram">+---------+     +----------+     +----------+     +---------+
+| 预测    | --> | 观察/实现 | --> | 自动验收 | --> | 制造故障 |
++---------+     +----------+     +----------+     +---------+
+                                                     |
++---------+     +-----------+     +----------+       |
+| 写下    | <-- | 解释错误  | <-- | 观察现象  | <----+
+| 结论    |     |           |     |          |
++---------+     +-----------+     +----------+
+</div>
+
+<ol>
+  <li><strong>预测</strong>：先动脑，写下你的假设，再动工具</li>
+  <li><strong>观察</strong>：用工具（ibv_devices、rping、tcpdump、perftest）收集证据</li>
+  <li><strong>实现</strong>：在 starter 中完成代码</li>
+  <li><strong>验收</strong>：<code>make verify</code> 自动检查</li>
+  <li><strong>故障注入</strong>：故意破坏参数/权限/连接顺序，观察失败模式</li>
+  <li><strong>解释</strong>：用 CQ 事件、CM 状态、资源计数器或抓包解释错误根因</li>
+  <li><strong>写下</strong>：完成 <code>reflection.md</code>，记录结论而不是"测试通过"</li>
+</ol>
+
+<div class="callout warn">
+  <strong>关键原则</strong>：
+  不要跳过"预测"和"故障注入"。只看正确路径会让你错误地以为自己理解了 RDMA。
+  真正理解 RDMA 的标志是：你能制造一个故障，然后在不用看代码的情况下预测出
+  WC status 是什么、CM 会触发哪个错误事件、资源计数器会如何变化。
+</div>
+
+<h2>故障排查快速参考</h2>
+
+<p>常见问题的排查入口（详细诊断请参考 <a href="08-troubleshooting.html">故障诊断指南</a>）：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>症状</th><th>可能原因</th><th>首先检查</th></tr>
+</thead>
+<tbody>
+<tr>
+  <td><code>ibv_devices</code> 为空</td>
+  <td>RXE 未加载或 link 未创建</td>
+  <td><code>lsmod | grep rdma_rxe</code> → <code>rdma link show</code></td>
+</tr>
+<tr>
+  <td><code>ibv_modify_qp</code> 失败</td>
+  <td>参数错误 / 端口未 ACTIVE / MTU 不匹配</td>
+  <td><code>ibv_devinfo</code> → 检查端口状态和 MTU</td>
+</tr>
+<tr>
+  <td>rping 连接超时</td>
+  <td>服务端未启动 / 端口不通 / 防火墙</td>
+  <td><code>ping</code> 确认 IP 连通性 → <code>ss -tlnp</code> 确认监听</td>
+</tr>
+<tr>
+  <td>WC status != SUCCESS</td>
+  <td>rkey 错误 / 权限不足 / 未 post recv</td>
+  <td>检查 WC 状态码 → 参考故障诊断页面的状态码表</td>
+</tr>
+<tr>
+  <td>RDMA WRITE 无效果</td>
+  <td>忘记 <code>IBV_ACCESS_REMOTE_WRITE</code></td>
+  <td><code>rdma resource show</code> 查看 MR 权限</td>
+</tr>
+<tr>
+  <td>性能数据异常低</td>
+  <td>TCG + Soft-RoCE 固有瓶颈</td>
+  <td>只比较相对趋势，不宣称绝对数字</td>
+</tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout note">
+  <strong>资源泄漏检测</strong>: <code>rdma resource show</code> 可以显示当前所有 QP、MR、CQ、PD 的计数。
+  实验 03 要求重复运行 20 次不残留资源。
+</div>
+
+<h2>实验顺序与依赖</h2>
+
+<p>实验严格按照 <code>00</code> → <code>05</code> 顺序完成：</p>
+<ul>
+  <li><strong>00</strong> 是纯观察实验，不需要写代码。建立基础设备概念和操作肌肉记忆</li>
+  <li><strong>01</strong> 使用手动 TCP 交换 QP 元数据，让你看见 raw verbs 没有替你解决连接协商</li>
+  <li><strong>02</strong> 在 01 的 RC QP 基础上增加 MR/rkey 和单边操作</li>
+  <li><strong>03</strong> 用 RDMA CM 替换 01/02 中的 TCP 控制通道，对比两种连接管理方式</li>
+  <li><strong>04</strong> 使用 perftest 和 perf 工具，不改变代码但改变参数和方法论</li>
+  <li><strong>05</strong> 用 libfabric provider 抽象重做 02 的 mailbox 功能，对比 raw verbs 和抽象层</li>
+</ul>
+
+<div class="callout note">
+  <strong>设计动机</strong>：先暴露问题（手动交换元数据太麻烦），再给出解决方案（RDMA CM），
+  再提出新问题（provider 锁死），再给出更高抽象（libfabric/UCX）。
+  每一课的"为什么"由前一课的实际体验回答。
+</div>
+
+<footer class="footer">
+  <nav>
+    <a href="index.html">← 返回门户</a>
+    <a href="00-glossary.html">下一章：术语表 →</a>
+  </nav>
+</footer>
+
+</main>
+</body>
+</html>

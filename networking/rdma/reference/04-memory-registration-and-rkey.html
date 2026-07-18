@@ -1,0 +1,319 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>04 · 内存注册与 rkey — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html" class="active">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+<main class="main">
+<h1>内存注册与 rkey</h1>
+<p class="subtitle">内存 pinning、lkey/rkey 访问控制与远端内存访问的安全模型</p>
+
+<h2>为什么需要注册内存</h2>
+<p>RDMA 绕过操作系统内核直接将数据从远端写入本机内存。这一特性要求：在发起 DMA 操作之前，目标内存区域必须已被 <strong>固定（pinned）</strong>，即其物理页面不允许被内核换出。如果页面被换出，HCA（Host Channel Adapter）DMA 引擎将访问到错误的物理地址，导致数据损坏或系统崩溃。</p>
+<p>注册内存时，内核完成以下步骤：</p>
+<ol>
+  <li>检查用户指定的虚拟地址区间，确认其属于调用进程的地址空间。</li>
+  <li>对该区间内所有虚拟页面执行 <strong>get_user_pages</strong>，将其固定到物理内存中（页面锁定）。</li>
+  <li>建立虚拟地址 → 物理地址的映射表，即 <strong>PBL（Physical Buffer List）</strong>，或称 <strong>page list</strong>。</li>
+  <li>将 PBL 写入 HCA 硬件页表，使 HCA 能够直接将传入数据 DMA 到正确的物理地址。</li>
+</ol>
+<p>硬件 DMA 引擎要求物理地址在传输单元内连续。对于大块内存，需要使用 <strong>Scatter-Gather List（SGL）</strong> 来应对非连续物理页面，或者提前分配 <strong>huge pages</strong> 以减小页表碎片。</p>
+
+<h2>ibv_reg_mr</h2>
+<p><code>ibv_reg_mr</code> 是所有 RDMA 数据传输的基础——它创建并注册一个 <strong>Memory Region（MR）</strong>，返回一个包含 <code>lkey</code>（本地 key）和 <code>rkey</code>（远端 key）的 <code>ibv_mr</code> 结构。函数签名如下：</p>
+<pre><code>#include &lt;infiniband/verbs.h&gt;
+
+struct ibv_mr *ibv_reg_mr(struct ibv_pd *pd,
+                           void *addr,
+                           size_t length,
+                           int access);</code></pre>
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>pd</code></td>
+      <td>Protection Domain——MR 必须属于某个 PD，只有同一 PD 内的 QP 才能使用该 MR。</td>
+    </tr>
+    <tr>
+      <td><code>addr</code></td>
+      <td>待注册内存的起始虚拟地址，需按系统页面对齐（通常 4K）。</td>
+    </tr>
+    <tr>
+      <td><code>length</code></td>
+      <td>注册区间长度（字节）。</td>
+    </tr>
+    <tr>
+      <td><code>access</code></td>
+      <td>按位或的访问权限标志，控制 HCA 如何访问该内存。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h3>访问权限标志</h3>
+<table>
+  <thead>
+    <tr>
+      <th>标志</th>
+      <th>含义</th>
+      <th>使用场景</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>IBV_ACCESS_LOCAL_WRITE</code></td>
+      <td>允许本机 HCA 通过 <code>lkey</code> 对该 MR 执行写操作。</td>
+      <td>几乎所有需要接收数据的 QP 都必须设置此标志。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_ACCESS_REMOTE_WRITE</code></td>
+      <td>允许远端 HCA 通过 <code>rkey</code> 对该 MR 执行 RDMA WRITE。</td>
+      <td>服务端暴露写入缓冲区给客户端。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_ACCESS_REMOTE_READ</code></td>
+      <td>允许远端 HCA 通过 <code>rkey</code> 对该 MR 执行 RDMA READ。</td>
+      <td>服务端暴露读取缓冲区给客户端。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_ACCESS_REMOTE_ATOMIC</code></td>
+      <td>允许远端 HCA 对该 MR 执行原子操作（fetch-and-add / compare-and-swap）。</td>
+      <td>分布式锁、计数器场景。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_ACCESS_MW_BIND</code></td>
+      <td>允许在该 MR 上绑定 <strong>Memory Window</strong>（用于动态撤销访问权限）。</td>
+      <td>需要对子区间做细粒度权限控制的场景。</td>
+    </tr>
+  </tbody>
+</table>
+<p>如果不设 <code>IBV_ACCESS_LOCAL_WRITE</code>，即使你是本机也无法将数据写入该 MR——这意味着 <code>ibv_post_recv</code> 的目标缓冲区必须带有该标志。</p>
+
+<h2>lkey vs rkey</h2>
+<p><code>ibv_mr</code> 包含两个 key：<code>lkey</code>（local key）和 <code>rkey</code>（remote key）。尽管二者通常数值相同，其语义完全不同：</p>
+<table>
+  <thead>
+    <tr>
+      <th>属性</th>
+      <th>lkey</th>
+      <th>rkey</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>用途</td>
+      <td>本机 HCA 访问本地内存</td>
+      <td>远端 HCA 访问本机内存</td>
+    </tr>
+    <tr>
+      <td>出现在</td>
+      <td>每个 <code>ibv_sge</code> 的 <code>lkey</code> 字段</td>
+      <td>每个 <code>ibv_send_wr</code> 中 <code>rkey</code> 字段（RDMA WRITE/READ/ATOMIC）</td>
+    </tr>
+    <tr>
+      <td>谁持有</td>
+      <td>本机进程内部使用</td>
+      <td>通过网络发送给远端节点</td>
+    </tr>
+    <tr>
+      <td>访问检查</td>
+      <td>HCA 校验 lkey 是否匹配 MR</td>
+      <td>HCA 校验 rkey 是否匹配 MR，并检查 access flags</td>
+    </tr>
+  </tbody>
+</table>
+<p><strong>rkey 是一种 capability，而非完整的安全机制。</strong>任何获知 rkey 的远端节点都可以在对应 access flags 允许的范围内访问你的内存。rkey 不绑定 IP 地址或连接身份，因此 rkey 泄露等同于将该部分内存的读写权限拱手让人。</p>
+
+<div class="callout warn">
+  <strong>安全警告：</strong>不要将 rkey 记录到日志、调试输出或监控仪表盘中。rkey 是明文透传到远端节点的，网络上没有加密保护。在需要动态权限控制的场景，使用 Memory Window 替代直接暴露 rkey。
+</div>
+
+<h2>内存窗口（Memory Window）</h2>
+<p>Memory Window（MW）为 Memory Region 提供了<strong>动态、可撤销</strong>的访问控制。基本思路：</p>
+<ol>
+  <li>将一个较大的 MR 注册好（不设或仅设最小远端权限）。</li>
+  <li>为该 MR 分配一个 MW，MW 有自己的 <code>rkey</code>。</li>
+  <li>在需要时才将 MW 绑定到 <code>ibv_bind_mw</code> 指定的子区间，生成新的临时 <code>rkey</code>。</li>
+  <li>绑定完成后将 MW 的 <code>rkey</code> 发送给远端节点。绑定可被撤销，撤销后旧 <code>rkey</code> 立即失效。</li>
+</ol>
+
+<h3>Type 1 vs Type 2B MW</h3>
+<table>
+  <thead>
+    <tr>
+      <th>特性</th>
+      <th>Type 1 MW</th>
+      <th>Type 2B MW</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>绑定方式</td>
+      <td>直接在 <code>ibv_bind_mw</code> 中指定窗口子区间</td>
+      <td>通过 send Work Request 绑定（<code>IBV_WR_BIND_MW</code>）</td>
+    </tr>
+    <tr>
+      <td>控制粒度</td>
+      <td>子区间 + 固定的 access flags</td>
+      <td>子区间 + 动态的 access flags</td>
+    </tr>
+    <tr>
+      <td>撤销</td>
+      <td>MW 被销毁时</td>
+      <td>绑定新的窗口或销毁 MW 时</td>
+    </tr>
+    <tr>
+      <td>适用场景</td>
+      <td>服务器端静态共享缓冲区</td>
+      <td>客户端临时授权访问特定数据段</td>
+    </tr>
+  </tbody>
+</table>
+<pre><code>struct ibv_mw *ibv_alloc_mw(struct ibv_pd *pd, enum ibv_mw_type type);
+int ibv_bind_mw(struct ibv_qp *qp, struct ibv_mw *mw,
+                struct ibv_mw_bind *bind);</code></pre>
+
+<h2>安全边界</h2>
+<p>RDMA 的安全模型建立在 "rkey 即权限" 的假设之上，这在生产环境中需要多重防护：</p>
+<ul>
+  <li><strong>rkey 泄漏</strong>：若攻击者截获网络报文（RoCE 在以太网层无加密），可直接读取/写入目标内存。对策：使用 IPsec 或 MACsec 加密链路，或使用 iWARP 本身的加密能力。</li>
+  <li><strong>最小权限原则</strong>：只为确实需要的操作开启对应 access flags。例如只读场景不要加 <code>IBV_ACCESS_REMOTE_WRITE</code>。</li>
+  <li><strong>每连接独立 MR</strong>：为每个连接创建独立的 MR 和 PD，避免跨连接污染。</li>
+  <li><strong>Trust Zone</strong>：RDMA 假定所有节点在同一 trust domain 内。跨 trust domain 的 RDMA 通信需要额外的安全隧道（如 TLS over RDMA 或使用使用加密的 NVMe-oF）。</li>
+  <li><strong>cgroup RDMA 控制器</strong>：Linux 内核提供 <code>rdma</code> cgroup controller，可限制每个 cgroup 中 RDMA 资源（MR 数量、QP 数量）的使用上限，防止单一进程耗尽系统资源。</li>
+</ul>
+
+<h2>性能考量</h2>
+<p><code>ibv_reg_mr</code> 是一个<strong>昂贵的操作</strong>。其开销来源于：</p>
+<ul>
+  <li><strong>get_user_pages</strong>：遍历进程页表并逐页锁定，开销随注册大小线性增长。</li>
+  <li><strong>PBL 构建</strong>：将物理地址列表填入 HCA 页表格式，需要内核态与硬件交互。</li>
+  <li><strong>TLB 刷新</strong>：部分硬件在注册后需要刷新 IOMMU TLB。</li>
+</ul>
+
+<h3>优化策略</h3>
+<table>
+  <thead>
+    <tr>
+      <th>策略</th>
+      <th>原理</th>
+      <th>适用场景</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Registration Cache</td>
+      <td>一次性注册大块内存，反复使用。不重新注册，只换用不同的子区间。</td>
+      <td>多数生产场景；但需注意 MR 内的访问边界由用户代码管理。</td>
+    </tr>
+    <tr>
+      <td>Huge Pages</td>
+      <td>使用 2M 或 1G 大页可大幅减少 PBL 条目数（减少 512 倍 vs 4K 页）。</td>
+      <td>大数据传输、数据库、存储服务器。</td>
+    </tr>
+    <tr>
+      <td>On-Demand Paging（ODP）</td>
+      <td>注册时不确定物理页面，由硬件在访问时触发缺页并固定。</td>
+      <td>避免预固定大块内存；但每次缺页引入延迟，不适合延迟敏感场景。</td>
+    </tr>
+  </tbody>
+</table>
+<pre><code>/* 注册缓存模式：预分配 64 MB，反复使用 */
+void *buf = mmap(NULL, 64 &lt;&lt; 20, PROT_READ | PROT_WRITE,
+                 MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+struct ibv_mr *mr = ibv_reg_mr(pd, buf, 64 &lt;&lt; 20,
+                                IBV_ACCESS_LOCAL_WRITE |
+                                IBV_ACCESS_REMOTE_WRITE);</code></pre>
+
+<h2>常见错误</h2>
+<table>
+  <thead>
+    <tr>
+      <th>错误</th>
+      <th>症状</th>
+      <th>原因</th>
+      <th>修复</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>注册区间过小</td>
+      <td>RDMA WRITE 写入超出 MR 范围导致 <code>REM_ACCESS_ERR</code></td>
+      <td>注册时 length 小于实际传输数据长度</td>
+      <td>确保 <code>addr + length</code> 覆盖所有传输操作</td>
+    </tr>
+    <tr>
+      <td>遗漏远端写标志</td>
+      <td>RDMA WRITE 返回 <code>IBV_WC_REM_ACCESS_ERR</code></td>
+      <td>ibv_reg_mr 未包含 <code>IBV_ACCESS_REMOTE_WRITE</code></td>
+      <td>检查 access 参数，确保包含所需标志</td>
+    </tr>
+    <tr>
+      <td>在途 WR 时注销 MR</td>
+      <td>硬件访问已释放的内存 → 数据损坏或 crash</td>
+      <td>ibv_dereg_mr 在仍有未完成 WR 时被调用</td>
+      <td>确保所有 WR 已完成再进行 deregister</td>
+    </tr>
+    <tr>
+      <td>把 rkey 当身份认证</td>
+      <td>攻击者伪造 rkey 访问内存</td>
+      <td>rkey 不是加密凭据，不绑定源地址</td>
+      <td>使用 MW + 短有效期 rkey，或网络层加密</td>
+    </tr>
+    <tr>
+      <td>页对齐错误</td>
+      <td><code>ibv_reg_mr</code> 返回 <code>EINVAL</code></td>
+      <td>addr 或长度未按系统页面大小对齐</td>
+      <td>使用 <code>posix_memalign</code> 或 <code>mmap</code> 确保对齐</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <strong>关键提醒：</strong>rkey 是对 MR 的访问令牌，其安全性等价于一个明文口令。在分布式系统中，永远不要假设 rkey 是秘密——你应当在网络层加固（IPsec/MACsec）而非依赖 rkey 自身。
+</div>
+
+<footer class="footer">
+  <nav><a href="03-qp-state-and-completion.html">← 上一页</a><a href="index.html">门户</a><a href="05-rdma-cm-state-machine.html">下一页 →</a></nav>
+</footer>
+</main>
+</body>
+</html>

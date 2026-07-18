@@ -1,0 +1,428 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>08 · RDMA 故障诊断指南 — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html" class="active">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+<main class="main">
+<h1>RDMA 故障诊断指南</h1>
+<p class="subtitle">设备发现、QP 状态、连接建立与性能异常的排查流程</p>
+
+<h2>诊断工具箱</h2>
+<p>以下命令是 RDMA 故障诊断的必备工具。面对任何 RDMA 异常，先从头到尾跑一遍：</p>
+<table>
+  <thead>
+    <tr>
+      <th>命令</th>
+      <th>用途</th>
+      <th>关键输出</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>ibv_devices</code></td>
+      <td>列出所有 RDMA 设备</td>
+      <td>设备名列表。空输出 = 驱动未加载或未发现设备。</td>
+    </tr>
+    <tr>
+      <td><code>ibv_devinfo</code></td>
+      <td>详细的设备信息和端口属性</td>
+      <td>端口状态（PORT_ACTIVE/INIT/DOWN）、MTU、GID 列表、<code>max_qp</code>/<code>max_mr</code>/<code>max_cq</code> 等资源上限。</td>
+    </tr>
+    <tr>
+      <td><code>rdma link show</code></td>
+      <td>查看 RDMA 链路状态（rdma-core 新版）</td>
+      <td>RXE 设备状态和绑定的 netdev。</td>
+    </tr>
+    <tr>
+      <td><code>rdma resource show</code></td>
+      <td>显示系统级 RDMA 资源使用量</td>
+      <td>QP / MR / CQ / PD 数量。可加 <code>qp</code> / <code>mr</code> / <code>cm_id</code> 子命令查看详情。</td>
+    </tr>
+    <tr>
+      <td><code>ibstat</code></td>
+      <td>InfiniBand HCA 物理端口状态</td>
+      <td>物理状态（<code>LinkUp</code>/<code>LinkDown</code>）、逻辑状态（<code>Actice</code>/<code>Init</code>/<code>Arm</code>）、速率（FDR/EDR/HDR）。</td>
+    </tr>
+    <tr>
+      <td><code>perfquery</code></td>
+      <td>InfiniBand 性能计数器</td>
+      <td>符号错误计数、链路 CRC 错误、缓冲区超限等。</td>
+    </tr>
+    <tr>
+      <td><code>tcpdump -i eth0 udp port 4791</code></td>
+      <td>捕获 RoCEv2 流量（RoCEv2 封装在 UDP）</td>
+      <td>验证报文长度、序列号、是否有重传。</td>
+    </tr>
+    <tr>
+      <td><code>strace -e trace=ioctl,writev,readv</code></td>
+      <td>跟踪控制路径 syscall</td>
+      <td>确认 <code>ibv_reg_mr</code> 是否调用了 <code>mmap</code>/ <code>ioctl</code>。不要对数据路径做 strace！</td>
+    </tr>
+    <tr>
+      <td><code>dmesg | grep -iE "rxe|infiniband|mlx|rdma"</code></td>
+      <td>内核 RDMA 错误消息</td>
+      <td>模块加载失败、RXE 注册错误、HCA 固件异常。</td>
+    </tr>
+    <tr>
+      <td><code>rdma statistic show</code></td>
+      <td>per-QP 的统计计数器</td>
+      <td>发送/接收字节数、错误包数、重传次数。</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout note">
+  <strong>快速检查清单：</strong>
+  <code>ibv_devices</code> 能看到设备吗？→ <code>ibv_devinfo</code> 端口是 ACTIVE 吗？→ 两端都能 ping 通吗？→ <code>rdma resource show</code> 有资源泄漏吗？→ <code>dmesg</code> 有错误吗？从头排查，每一步都不要猜。
+</div>
+
+<h2>设备不可见</h2>
+<p><code>ibv_devices</code> 输出为空或缺少预期设备。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>原因</th>
+      <th>检查方法</th>
+      <th>修复</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>内核模块未加载</td>
+      <td><code>lsmod | grep rdma_rxe</code>（Soft-RoCE）或 <code>lsmod | grep mlx</code>（Mellanox）</td>
+      <td><code>sudo modprobe rdma_rxe</code> 或 <code>sudo modprobe mlx5_ib</code></td>
+    </tr>
+    <tr>
+      <td>RXE 链路未创建</td>
+      <td><code>rdma link show</code> 无 rxe 设备</td>
+      <td><code>sudo rdma link add rxe0 type rxe netdev eth0</code></td>
+    </tr>
+    <tr>
+      <td>权限拒绝</td>
+      <td><code>ls -l /dev/infiniband/*</code> 属主是 root</td>
+      <td>将用户加入 <code>rdma</code> 组，或添加 udev 规则：<br><code>SUBSYSTEM=="infiniband", MODE="0666"</code></td>
+    </tr>
+    <tr>
+      <td>rdma-core 未安装</td>
+      <td><code>dpkg -l | grep rdma-core</code> 空</td>
+      <td><code>sudo apt install rdma-core ibverbs-utils perftest</code></td>
+    </tr>
+    <tr>
+      <td>网卡不支持 RoCE</td>
+      <td><code>ethtool -i eth0</code> 驱动不是 mlx/irdma/qedr</td>
+      <td>确认网卡型号。普通 Intel/Realtek 网卡不支持。使用 Soft-RoCE（RXE）模拟。</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <strong>常见陷阱：</strong>创建 RXE 链路后 <code>ibv_devinfo</code> 显示端口为 <code>PORT_INIT</code> 而非 <code>PORT_ACTIVE</code>。这通常是因为绑定的 netdev 未处于 UP 状态。先 <code>ip link set eth0 up</code>，再重新创建 RXE 链路。
+</div>
+
+<h2>QP 状态卡住</h2>
+<p><code>ibv_post_send</code> 返回错误，或 QP 状态转换卡在 INIT/RTR。</p>
+
+<pre><code># 检查 QP 状态（以 pid 为单位）
+rdma resource show qp -j | python3 -m json.tool
+
+# 或者手动用 ibv_devinfo 确认端口信息
+ibv_devinfo -d rxe0 | grep -A5 port</code></pre>
+
+<table>
+  <thead>
+    <tr>
+      <th>WC 状态</th>
+      <th>含义</th>
+      <th>常见原因</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>IBV_WC_RETRY_EXC_ERR</code></td>
+      <td>重试次数耗尽</td>
+      <td>对端 QP 未建立、路径 MTU 设置过大、丢包</td>
+    </tr>
+    <tr>
+      <td><code>IBV_WC_RNR_RETRY_EXC_ERR</code></td>
+      <td>RNR 重试次数耗尽</td>
+      <td>对端未及时 posted RECV，或 rnr_retry 计数设置过小</td>
+    </tr>
+    <tr>
+      <td><code>IBV_WC_REM_ACCESS_ERR</code></td>
+      <td>远端访问权限错误</td>
+      <td>rkey 无效或 access flags 不包含所需操作</td>
+    </tr>
+  </tbody>
+</table>
+
+<p>GID 不匹配是 RoCEv2 中最常见的配置错误：</p>
+<pre><code># 查看 GID 表
+ibv_devinfo -d rxe0 | grep GID
+
+# 用 ibv_query_gid 编程查看
+# 确保两端使用的 GID index 一致</code></pre>
+
+<div class="callout note">
+  <strong>快速修复：</strong>总是用 <code>ibv_modify_qp</code> 的 <code>IBV_QP_STATE</code> 属性并检查返回值。将 QP 状态转换打印到日志：<code>fprintf(stderr, "modify_qp to %s: %s\n", state_name, strerror(errno));</code>。
+</div>
+
+<h2>连接建立失败</h2>
+<p><code>rping</code> 或 <code>ib_send_bw</code> 无法连接。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>CM 事件</th>
+      <th>常见原因</th>
+      <th>排查步骤</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>ADDR_ERROR</code></td>
+      <td>主机名无法解析、源地址不属于任何 RDMA 设备、RDMA 设备不存在</td>
+      <td><code>ibv_devices</code> 确认设备存在。<code>rdma_getaddrinfo</code> 是否返回正确结果？</td>
+    </tr>
+    <tr>
+      <td><code>ROUTE_ERROR</code></td>
+      <td>没有到目标的路由，或在 InfiniBand 子网中找不到路径</td>
+      <td><code>ip route get DEST_IP</code> 确认路由存在。<code>ibping</code> 测试 IB 层可达性。</td>
+    </tr>
+    <tr>
+      <td><code>REJECTED</code></td>
+      <td>对端未在目标端口 listen，或 conn_param 不匹配</td>
+      <td><code>ss -tlnp | grep 3891</code> 确认 server 在监听。<code>rdma_conn_param</code> 中的 <code>responder_resources</code> 是否足够？</td>
+    </tr>
+    <tr>
+      <td><code>CONNECT_ERROR</code></td>
+      <td>CM 握手失败——防火墙或子网配置</td>
+      <td>确认 CM 端口（默认 3891）未被防火墙阻挡。RoCE 还需确认 UDP 4791 开放。</td>
+    </tr>
+    <tr>
+      <td><code>UNREACHABLE</code></td>
+      <td>对端完全无法到达</td>
+      <td>先 <code>ping</code> 确认三层连通。<code>ibping</code> 确认 IB 链路 UP。</td>
+    </tr>
+  </tbody>
+</table>
+
+<pre><code># 验证 server 是否在监听（CM 默认端口 3891）
+ss -tlnp | grep 3891
+# 若没有输出，检查 Firewall
+sudo iptables -L -n | grep 3891</code></pre>
+
+<h2>数据传输异常</h2>
+<p>连接成功了，但是 <code>ibv_poll_cq</code> 返回了非 <code>IBV_WC_SUCCESS</code> 的完成状态。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>WC 状态</th>
+      <th>含义</th>
+      <th>排查方向</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>IBV_WC_RNR_RETRY_EXC_ERR</code></td>
+      <td>Receiver Not Ready——对端缓冲区未就绪</td>
+      <td>确认对端在发送前已 <code>ibv_post_recv</code>。检查 queue depth 是否匹配。增大 <code>rnr_retry</code>（最大值 7）。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_WC_REM_ACCESS_ERR</code></td>
+      <td>远端访问权限错误</td>
+      <td>确认 MR 注册时包含 <code>IBV_ACCESS_REMOTE_WRITE</code>（RDMA WRITE）或 <code>IBV_ACCESS_REMOTE_READ</code>（RDMA READ）。检查 rkey 是否正确传递且未过期。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_WC_REM_OP_ERR</code></td>
+      <td>远端操作不允许——操作码不匹配或无权限</td>
+      <td>对端 HCA 不支持该 WR 操作码（如 RC 上执行 UD 操作）。检查 QP 类型匹配。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_WC_LOCAL_PROT_ERR</code></td>
+      <td>本地保护错误</td>
+      <td>SGE 中 lkey 无效、地址未注册、或 sge.length 超出 MR 范围。检查所有 SGE 参数。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_WC_INV_REQ_ERR</code></td>
+      <td>无效的 WR 请求——参数错误</td>
+      <td>检查 ibv_send_wr 的 opcode、num_sge、sg_list。确保 wr_id 唯一。</td>
+    </tr>
+    <tr>
+      <td><code>IBV_WC_WORK_REQ_FLUSHED_ERR</code></td>
+      <td>QP 已进入 Error 状态，所有在途 WR 被 flush</td>
+      <td>先确认前面的错误事件。将 QP 移回 Error 状态再重新建立（RC QP 在 Error 后不可恢复，必须销毁重建！）</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout warn">
+  <strong>关键提醒：</strong>RC QP 一旦进入 Error 状态——无论引起原因是什么——就<strong>不能重新初始化</strong>。必须 <code>ibv_destroy_qp</code> + <code>ibv_create_qp</code> 重建。这是设计约束，不是 bug。
+</div>
+
+<h2>资源泄漏</h2>
+<p>程序运行时出现 "cannot allocate memory" 或 "too many open files"。</p>
+
+<pre><code># 查看当前资源的用量
+rdma resource show qp
+rdma resource show mr
+rdma resource show cq
+rdma resource show pd
+
+# 确认进程的 memlock 限制（影响 MR 注册）
+ulimit -l  # 应设为 unlimited 或足够大</code></pre>
+
+<table>
+  <thead>
+    <tr>
+      <th>现象</th>
+      <th>可能原因</th>
+      <th>修复</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>QP count 持续增长</td>
+      <td>连接/断开循环中未正确销毁 QP</td>
+      <td>确保每个 <code>rdma_create_qp</code> 有对应的 <code>rdma_destroy_qp</code></td>
+    </tr>
+    <tr>
+      <td>MR count 持续增长</td>
+      <td>每次传输前注册新 MR，用完未注销</td>
+      <td>使用 registration cache 模式，预注册并复用 MR</td>
+    </tr>
+    <tr>
+      <td>PD count 增长</td>
+      <td>循环中创建 PD 未销毁</td>
+      <td>检查去初始化路径是否遗漏 <code>ibv_dealloc_pd</code></td>
+    </tr>
+    <tr>
+      <td>fd 耗尽</td>
+      <td>Event channel 和 CQ 的文件描述符未关闭</td>
+      <td>每个 <code>rdma_create_event_channel</code> 和 <code>ibv_create_cq</code> 都需要对应的 destroy</td>
+    </tr>
+    <tr>
+      <td>内存泄漏</td>
+      <td><code>ibv_post_recv</code> 分配的缓冲区未在清理时释放</td>
+      <td>使用 valgrind 定位泄漏。注意：valgrind 对 verbs 调用会产生大量 false positive，建议在 rdma-core debug build 下运行。</td>
+    </tr>
+  </tbody>
+</table>
+
+<div class="callout note">
+  <strong>环境默认值：</strong>系统默认 max QP 约 16K，max MR 约 64K。生产环境应检查 <code>/sys/class/infiniband/*/device/resource_*</code> 并适当调大。在容器中通过 <code>--ulimit memlock=unlimited</code> 解决 MR 注册问题。
+</div>
+
+<h2>性能异常</h2>
+<p>功能正常但延迟偏高或带宽不达标。</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>检查项</th>
+      <th>最快验证</th>
+      <th>修复</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>CPU Affinity</td>
+      <td><code>cat /proc/PID/status | grep Cpus_allowed_list</code></td>
+      <td>对网络相关的进程（主循环、轮询线程）执行 <code>taskset -c N</code>，N 应为 HCA 所在的 NUMA 节点上的核心。</td>
+    </tr>
+    <tr>
+      <td>中断分布</td>
+      <td><code>cat /proc/interrupts | grep mlx</code></td>
+      <td>确认中断被均衡到多个 CPU。使用 <code>irqbalance</code> 或手动 <code>smp_affinity</code> 调节。</td>
+    </tr>
+    <tr>
+      <td>Queue Depth</td>
+      <td>perftest 中对比 <code>-q 1</code> 和 <code>-q 64</code> 的结果</td>
+      <td>增大预 posted 的 WR 数量，使 HCA 可以流水线化。</td>
+    </tr>
+    <tr>
+      <td>Signaled 策略</td>
+      <td>比较全部 signaled 和每 16 个 WR signaled 的性能</td>
+      <td>启用选择性 signaling：在 <code>ibv_send_wr</code> 中使用 <code>IBV_SEND_SIGNALED</code> 每隔 N 个 WR 请求一次完成通知。</td>
+    </tr>
+    <tr>
+      <td>Inline</td>
+      <td>检查 <code>ibv_qp.cap.max_inline_data</code></td>
+      <td>对 ≤ max_inline_data 的消息设置 <code>IBV_SEND_INLINE</code>。减少 HCA 从内存中抓取小数据的 DMA 开销。</td>
+    </tr>
+    <tr>
+      <td>MTU</td>
+      <td><code>ibv_devinfo | grep max_mtu</code> vs 实际设置 <code>ip link show</code></td>
+      <td>设置 path MTU 为硬件最大值。RoCE 网络 MTU 设 9000 减少报文头占比。</td>
+    </tr>
+    <tr>
+      <td>Soft-RoCE 结论</td>
+      <td>比较同一测试的 CPU 利用率</td>
+      <td>RXE 的带宽受 CPU 频率限制，不是网络问题。不要调优 Software 模拟器，调优你的 host CPU 调度。</td>
+    </tr>
+  </tbody>
+</table>
+
+<pre><code># 性能诊断参考命令
+# CPU 亲和性检查
+taskset -cp $(pgrep ib_write_bw)
+
+# NUMA 拓扑（确认 HCA 所在的 NUMA 节点）
+lstopo-no-graphics | grep -i infiniband
+
+# 中断分布
+cat /proc/interrupts | grep -E "CPU|mlx|rxe" | head -10
+
+# MTU 确认
+ip link show eth0 | grep mtu
+
+# 测试不同 queue depth 的影响
+ib_write_bw -a -d rxe0 -s 1048576 -q 1    # 单队列
+ib_write_bw -a -d rxe0 -s 1048576 -q 128  # 深度队列</code></pre>
+
+<div class="callout warn">
+  <strong>不要浪费时间：</strong>在 Soft-RoCE（RXE）或 TCG 虚拟化环境中，不要试图优化 "带宽达不到 100 Gbps" 或 "延迟大于 10 μs"——这是软件模拟的物理天花板。这些环境只适合<strong>功能验证</strong>。硬件性能基准必须使用真实 HCA。
+</div>
+
+<footer class="footer">
+  <nav><a href="07-production-ecosystem.html">← 上一页</a><a href="index.html">门户</a><a href="../lessons/index.html">课程课件 →</a></nav>
+</footer>
+</main>
+</body>
+</html>

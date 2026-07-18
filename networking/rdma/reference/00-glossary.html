@@ -1,0 +1,235 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RDMA 术语表 — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html" class="active">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>RDMA 术语表</h1>
+<p class="subtitle">核心概念速查，适合在阅读后续讲义与实验时随时对照</p>
+
+<h2>传输层</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>术语</th><th>全称</th><th>简要说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>RDMA</strong></td><td>Remote Direct Memory Access</td><td>一种允许网卡直接读写远程主机内存的网络技术，绕过 OS 协议栈和 CPU，提供极低延迟与高带宽。</td></tr>
+<tr><td><strong>InfiniBand</strong></td><td>InfiniBand</td><td>从设计之初即为 RDMA 打造的全套网络体系，包含物理层、链路层、网络层和传输层规范。需要专用 HCA 和交换机。</td></tr>
+<tr><td><strong>RoCEv1</strong></td><td>RDMA over Converged Ethernet v1</td><td>在以太网上承载 InfiniBand 传输层协议，使用 EtherType 0x8915，限制在同一 L2 广播域内，无法路由。</td></tr>
+<tr><td><strong>RoCEv2</strong></td><td>RDMA over Converged Ethernet v2</td><td>将 InfiniBand 传输层封装在 UDP/IP (目标端口 4791) 中，可路由，是当前最广泛部署的以太网 RDMA 方案。</td></tr>
+<tr><td><strong>Soft-RoCE (RXE)</strong></td><td>Software RoCE</td><td>Linux 内核中的纯软件 RDMA 实现 (drivers/infiniband/sw/rxe/)，通过内核网络栈模拟 RNIC 行为，无需专用硬件。</td></tr>
+<tr><td><strong>iWARP</strong></td><td>Internet Wide Area RDMA Protocol</td><td>在 TCP 之上实现 RDMA 语义，利用现有 IP 网络基础设施，但 TCP 开销导致性能低于 RoCE/IB。</td></tr>
+<tr><td><strong>OmniPath</strong></td><td>Intel OmniPath Architecture</td><td>Intel 推出的专有互连架构，提供类似 InfiniBand 的高性能特性，已逐步退出市场。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>核心对象</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>术语</th><th>全称 / 解释</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Verbs</strong></td><td>RDMA 编程接口的统称，由 InfiniBand 规范定义。libibverbs 是 Linux 上的标准实现。</td></tr>
+<tr><td><strong>Protection Domain (PD)</strong></td><td>安全隔离域，将 MR、QP、AH 等对象绑定在一起。同一 PD 内的对象可以互相访问，跨 PD 需要 rkey 授权。</td></tr>
+<tr><td><strong>Memory Region (MR)</strong></td><td>注册到 HCA 的连续虚拟内存区域，注册后获得 lkey (本地) 和 rkey (远程) 两个句柄用于访问。</td></tr>
+<tr><td><strong>Completion Queue (CQ)</strong></td><td>存放 Work Completion (WC) 的队列。Post-send/post-recv 操作完成后，CQ 会收到对应 WC 通知。</td></tr>
+<tr><td><strong>Queue Pair (QP)</strong></td><td>RDMA 通信的基本端点，包含 Send Queue (SQ) 和 Receive Queue (RQ) 两个子队列。QP 是发送/接收操作的执行单位。</td></tr>
+<tr><td><strong>Work Request (WR)</strong></td><td>应用层通过 ibv_post_send / ibv_post_recv 提交的操作请求。描述"做什么"（SEND/RECV/RDMA WRITE 等）。</td></tr>
+<tr><td><strong>Work Queue Element (WQE)</strong></td><td>WR 被提交到 QP 后，由硬件/驱动转化为 WQE 放入硬件队列。WQE 是硬件可执行的格式。</td></tr>
+<tr><td><strong>Work Completion (WC)</strong></td><td>WQE 执行完成后在 CQ 中生成的事件记录。包含 opcode、status、byte_len、source QPN 等信息。</td></tr>
+<tr><td><strong>Shared Receive Queue (SRQ)</strong></td><td>多个 QP 共享的接收队列，用于减少接收缓冲区预分配总量。适合大规模连接场景（如 MPI）。</td></tr>
+<tr><td><strong>Address Handle (AH)</strong></td><td>包含目的地 L3/L4 地址信息的数据结构，用于 UD QP 的每条 send 操作指定对端。RC QP 在 transition 时内置在 QP 上下文中。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>QP 类型</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>类型</th><th>全称</th><th>特性</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>RC</strong></td><td>Reliable Connection</td><td>面向连接、可靠传输、保序。每个 QP 对应一个远端 QP。支持全部 opcode（SEND/RECV/RDMA WRITE/RDMA READ/ATOMIC）。</td></tr>
+<tr><td><strong>UC</strong></td><td>Unreliable Connection</td><td>面向连接但不保证可靠。no ACK/retransmission。不支持 RDMA READ 和 ATOMIC。延迟更低，适用于可容忍丢包的应用。</td></tr>
+<tr><td><strong>UD</strong></td><td>Unreliable Datagram</td><td>无连接、不可靠、不保序。一个 QP 可与任意多个远端的 QP 通信。最大 payload 受限于 MTU (通常 4096 bytes)。不支持 RDMA READ/WRITE/ATOMIC。</td></tr>
+<tr><td><strong>XRC</strong></td><td>Extended Reliable Connection</td><td>RC 的扩展，允许接收端多个 QP 共享同一个 SRQ，减少接收端 QP 数量。主要用于 MPI 场景。</td></tr>
+<tr><td><strong>DC</strong></td><td>Dynamic Connected</td><td>面向连接但连接是动态建立的。发送时自动创建或复用连接，适合 HPC 中的大规模全通信模式。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>操作类型</h2>
+
+<table>
+<thead>
+<tr><th>操作</th><th>描述</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>SEND</strong></td><td>主动端将本地 MR 中的数据发送到对端。对端必须预先 post RECV WR。双方 CPU 均参与。</td></tr>
+<tr><td><strong>RECV</strong></td><td>被动端接收 SEND 数据。数据写入预先 post 的 RECV WR 指定的缓冲区。</td></tr>
+<tr><td><strong>RDMA WRITE</strong></td><td>主动端直接将本地数据写入对端 MR（需对端 rkey）。对端 CPU 完全不感知，属于单边操作。</td></tr>
+<tr><td><strong>RDMA READ</strong></td><td>主动端从对端 MR 读取数据到本地缓冲区（需对端 rkey）。仅 RC 支持。对端 CPU 完全不感知。</td></tr>
+<tr><td><strong>RDMA WRITE_WITH_IMM</strong></td><td>RDMA WRITE 的同时携带 4 字节 immediate data。对端会在 CQ 中收到一个 WC，含 immediate 值。</td></tr>
+<tr><td><strong>ATOMIC (Fetch-and-Add)</strong></td><td>原子加法操作。对端 MR 中的一个 64-bit 值 += operand。原值返回给发起方。仅 RC 支持。</td></tr>
+<tr><td><strong>ATOMIC (Compare-and-Swap)</strong></td><td>原子比较并交换。如果对端的值 == compare，则 swap 为新值。结果返回给发起方。仅 RC 支持。</td></tr>
+</tbody>
+</table>
+
+<h2>连接管理</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>术语</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>RDMA CM</strong></td><td>RDMA Connection Manager，内核模块 <code>rdma_cm.ko</code>，负责建立和管理 RDMA 连接，抽象出地址解析、路由解析、连接建立等步骤。</td></tr>
+<tr><td><strong>librdmacm</strong></td><td>用户态库，封装 RDMA CM 的内核接口，提供 <code>rdma_create_id()</code>、<code>rdma_connect()</code>、<code>rdma_listen()</code> 等 API。</td></tr>
+<tr><td><strong>rdma_cm_id</strong></td><td>CM 通信标识符，绑定一个 <code>ibv_qp</code> 和相关地址信息。应用通过 rdma_cm_id 发起/接受连接。</td></tr>
+<tr><td><strong>Address Resolution</strong></td><td>将目标 IP 地址解析为 GID 或 LID，映射到具体的 RDMA 设备和端口。通过 <code>rdma_resolve_addr()</code> 触发。</td></tr>
+<tr><td><strong>Route Resolution</strong></td><td>确定从本地设备到目标设备的路径（在 InfiniBand 子网管理器中查路由表）。通过 <code>rdma_resolve_route()</code> 触发。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>控制面接口</h2>
+
+<table>
+<thead>
+<tr><th>术语</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>uverbs</strong></td><td>Linux 内核为用户态提供的 RDMA 控制面接口，通过 <code>/dev/infiniband/uverbsX</code> 字符设备访问。本质是 ioctl 或 write() 系统调用。</td></tr>
+<tr><td><strong>ib_uverbs</strong></td><td>内核模块 (<code>ib_uverbs.ko</code>)，处理 uverbs 系统调用，在内核中创建/销毁/修改 RDMA 对象。</td></tr>
+<tr><td><strong>rdma-core</strong></td><td>用户态 RDMA 软件栈（开源），包含 libibverbs、librdmacm、libibumad、以及各厂商的 verbs provider (mlx5, rxe 等)。</td></tr>
+<tr><td><strong>libibverbs</strong></td><td>最基础的 RDMA 用户态库，提供 <code>ibv_open_device</code>、<code>ibv_alloc_pd</code>、<code>ibv_post_send</code> 等动词 API。</td></tr>
+<tr><td><strong>librdmacm</strong></td><td>连接管理库，基于 libibverbs 提供更上层的连接建立 API。</td></tr>
+<tr><td><strong>libfabric</strong></td><td>OpenFabrics Interface (OFI) 的参考实现，提供比 raw verbs 更通用的 fabric 抽象。HPC 应用 (MPI) 的底层传输抽象。</td></tr>
+<tr><td><strong>UCX</strong></td><td>Unified Communication X，UCSD 开发的高性能通信框架，在 libibverbs/libfabric 之上提供统一通信接口。UCC 是集合操作的扩展。</td></tr>
+</tbody>
+</table>
+
+<h2>内存相关</h2>
+
+<table>
+<thead>
+<tr><th>术语</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>lkey</strong></td><td>Local Key，MR 注册时获得的本地访问密钥。在本地 QP post WR 时使用，标识本地缓冲区。</td></tr>
+<tr><td><strong>rkey</strong></td><td>Remote Key，MR 注册时获得的远程访问密钥。对端在发起 RDMA WRITE/RDMA READ/ATOMIC 时使用。rkey 是安全凭证，但缺乏细粒度权限控制。</td></tr>
+<tr><td><strong>Memory Registration</strong></td><td>将应用缓冲区注册到 HCA 的过程，包括 pinning 内存页、建立 DMA 映射、生成 lkey/rkey。调用 <code>ibv_reg_mr()</code>。</td></tr>
+<tr><td><strong>Memory Pinning</strong></td><td>将虚拟内存页锁定在物理内存中，防止被 swap 出去。HCA 需要访问的是物理地址，pinning 确保物理页在 DMA 期间始终有效。</td></tr>
+<tr><td><strong>Physical Buffer List (PBL)</strong></td><td>描述 MR 对应的物理页帧列表。HCA 使用 PBL 进行 DMA 地址翻译，将虚拟地址转换为物理地址。</td></tr>
+<tr><td><strong>Memory Window (MW)</strong></td><td>基于已有 MR 动态创建的远程访问窗口，支持更灵活的 rkey 生命周期管理。典型用法：绑定后分成多个子窗口授予不同对端。</td></tr>
+</tbody>
+</table>
+
+<h2>地址标识</h2>
+
+<table>
+<thead>
+<tr><th>术语</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>LID</strong></td><td>Local Identifier，InfiniBand 子网中由子网管理器分配的 16-bit 地址。每个 HCA 端口有一个 LID。RoCE 不使用 LID。</td></tr>
+<tr><td><strong>GID</strong></td><td>Global Identifier，128-bit 类 IPv6 地址。RoCE 使用 GID 标识端口（基于 MAC 或 IPv6 生成）。</td></tr>
+<tr><td><strong>GRH</strong></td><td>Global Routing Header，RoCE/IB 跨子网时携带 GID 信息的路由头。RoCEv2 中 GRH 可省略或存在。</td></tr>
+<tr><td><strong>QPN</strong></td><td>Queue Pair Number，HCA 分配给每个 QP 的唯一编号。在 RC 中，远程端通过 QPN 定位通信对端。</td></tr>
+<tr><td><strong>PSN</strong></td><td>Packet Sequence Number，每个 RDMA 数据包的序号。RC 使用 PSN 实现可靠传输、丢包检测和重传。</td></tr>
+<tr><td><strong>SGID</strong></td><td>Source GID，发起端 GID。RoCE 数据包头部携带的发送端 GID。</td></tr>
+<tr><td><strong>DGID</strong></td><td>Destination GID，目标端 GID。RoCE 数据包头部携带的接收端 GID。</td></tr>
+</tbody>
+</table>
+
+<h2>协议层</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>术语</th><th>位置</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>InfiniBand Transport</strong></td><td>传输层</td><td>定义数据包如何在 IB 子网中可靠/不可靠传输，包括分段、重组、流控等机制。</td></tr>
+<tr><td><strong>RoCEv2 (UDP/4791)</strong></td><td>传输层</td><td>RoCEv2 数据包使用 UDP 封装，目标端口 4791，源端口为 QPN 的哈希。UDP 使得报文可被标准 IP 路由器转发。</td></tr>
+<tr><td><strong>BTH</strong></td><td>Base Transport Header</td><td>每个 RDMA 数据包的必备头部。包含 opcode、destination QPN、PSN、分片标志等。</td></tr>
+<tr><td><strong>RETH</strong></td><td>RDMA Extended Transport Header</td><td>RDMA WRITE/READ 操作的扩展头部。包含远程虚拟地址、rkey、DMA 长度。</td></tr>
+<tr><td><strong>IETH</strong></td><td>Invalidate Extended Transport Header</td><td>携带 imm_data (4 字节) 的头，用于 WRITE_WITH_IMM 或 SEND_WITH_IMM。对端收到后 imm_data 作为 WC 的一部分返回。</td></tr>
+<tr><td><strong>AETH</strong></td><td>Acknowledgment Extended Transport Header</td><td>ACK/NACK 确认包中的扩展头部。包含确认 PSN、特征字段 ( Syndrome ) 表示错误类型。</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>性能相关</h2>
+
+<table>
+<thead>
+<tr><th>术语</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>Queue Depth</strong></td><td>QP 的 SQ/RQ 硬件队列深度，即可同时容纳的 WQE 数量。深度越大，CPU 与 HCA 间容忍的延迟越高，但占用内存也越多。</td></tr>
+<tr><td><strong>Selective Signaling</strong></td><td>选择性地为 WR 请求生成完成事件。信号 WR 会在 CQ 中产生 WC；无信号 WR 不产生 WC。通过 <code>ibv_send_wr.send_flags & IBV_SEND_SIGNALED</code> 控制。</td></tr>
+<tr><td><strong>Inline Send</strong></td><td>将小数据 (< 256B) 直接嵌入 WQE 中，避免 HCA 从内存中 DMA 读取。显著减少小消息延迟。</td></tr>
+<tr><td><strong>Zero-Copy</strong></td><td>RDMA 的核心优势：数据在 HCA 与用户缓冲区之间直接传输，无需中间拷贝（无需内核缓冲区，无需 socket buffer）。</td></tr>
+<tr><td><strong>MSI-X</strong></td><td>中断重定向机制。每个 CQ 可绑定独立的 MSI-X 中断向量，实现多核分摊 CQ 处理。配合 CPU 亲和性设置可显著提升性能。</td></tr>
+<tr><td><strong>Interrupt Coalescing</strong></td><td>HCA 合并多个完成事件后统一产生一次中断。减少中断频率，降低 CPU 开销，但会增加单次延迟。</td></tr>
+</tbody>
+</table>
+
+<div class="callout note">
+<strong>提示</strong>
+本术语表是参考讲义的核心工具。每个术语在后面章节中会有更详细的展开。遇到不熟悉的缩写时回到此页查看定位。
+</div>
+
+<footer class="footer">
+  <nav><a href="index.html">← 返回门户</a><a href="01-rdma-data-path.html">下一页 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

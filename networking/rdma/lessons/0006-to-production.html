@@ -1,0 +1,191 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第六课 · 从 raw verbs 走向生产 — RDMA 课程</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 课程课件</a></h2>
+  <nav>
+    <div class="section-label">课时</div>
+    <ul>
+      <li><a href="0001-dma-to-rdma.html">01 · 从 DMA 到 RDMA</a></li>
+      <li><a href="0002-device-and-env.html">02 · 设备发现与环境</a></li>
+      <li><a href="0003-core-objects.html">03 · 核心对象模型</a></li>
+      <li><a href="0004-data-path.html">04 · 数据路径深入</a></li>
+      <li><a href="0005-connection-models.html">05 · 连接模型</a></li>
+      <li><a href="0006-to-production.html" class="active">06 · 走向生产</a></li>
+    </ul>
+    <div class="section-label">参考</div>
+    <ul>
+      <li><a href="../reference/lab-guide.html">实验指导</a></li>
+      <li><a href="../reference/index.html">参考讲义</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>第六课 · 从 raw verbs 走向生产</h1>
+<p class="subtitle">理解 RDMA 生产生态：libfabric、UCX、MPI、NCCL，以及你已学到的知识如何复用</p>
+
+<h2>生产 RDMA 栈全景</h2>
+
+<p>在实际生产环境中，很少有应用直接调用 <code>ibv_post_send</code> 和 <code>ibv_poll_cq</code>。RDMA 软件栈是一个分层的金字塔：</p>
+
+<div class="diagram">                    MPI / NCCL / SHMEM
+                         |        |
+                        UCX       |
+                         |        |
+                     libfabric    |
+                      /     \     |
+              rdma-core    EFA     \
+                /    \       \      \
+        InfiniBand  RoCE    AWS EFA  ...
+        (mlx5)     (mlx5)   (efa)
+
+更抽象 / 更易用
+     ↑
+     |               每层都在复用下面的概念
+     |               (MR, CQ, QP, WC, ...)
+     |
+更底层 / 更高性能控制
+
+     raw verbs  ←──── 本课程 6 课的核心</div>
+
+<h2>为什么不用 raw verbs 写生产代码？</h2>
+
+<h3>1. Provider 锁定</h3>
+<p>直接使用 <code>ibv_*</code> 函数族意味着你的代码被绑定到 InfiniBand Verbs API。如果你的应用需要同时支持 InfiniBand、RoCEv2、AWS EFA、Intel iWARP，用 raw verbs 需要为每个 provider 编写不同的后端。</p>
+
+<p>相比之下，libfabric 通过 <code>fi_getinfo()</code> + provider 抽象层，让同一份代码可以不加修改地在不同 fabric 上运行。</p>
+
+<h3>2. 连接管理重复劳动</h3>
+<p>第五课展示了手工 TCP + raw verbs 的复杂度。生产中的连接管理还要处理：断线重连、多路径、多路复用（多个通信流共享一个 QP）、负载均衡。每个应用都重新实现这些逻辑是不现实的。</p>
+
+<h3>3. 错误恢复</h3>
+<p>RDMA 的 QP 一旦进入 ERR 状态，整个 QP 都不可用。生产代码需要检测错误状态、flush 待处理 WR、销毁旧 QP、创建新 QP、重新建立连接。raw verbs 把所有这些都留给应用处理。</p>
+
+<h3>4. 性能调优</h3>
+<p>不同的 RDMA 硬件有不同的性能参数：最优 inline 大小、doorbell 批量策略、CQ 轮询 vs 中断模式、NUMA 亲和性等。抽象层内置了常见硬件的调优经验。</p>
+
+<h2>libfabric：provider 抽象层</h2>
+
+<p>libfabric（也称 OFI Libfabric）是目前最广泛使用的 RDMA 抽象层。它为上层应用（如 UCX、MPI）提供了一组统一的 fabric API。</p>
+
+<h3>核心对象映射</h3>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>libfabric 对象</th><th>verbs 对应</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>fi_fabric()</code></td><td>—（设备组）</td><td>代表一组 RDMA 设备，范围最广的对象</td></tr>
+<tr><td><code>fi_domain()</code></td><td><code>ibv_pd</code></td><td>资源隔离边界，对应 PD</td></tr>
+<tr><td><code>fi_ep()</code></td><td><code>ibv_qp</code></td><td>通信端点，支持 RDM（可靠数据报）和 MSG（面向连接）两种类型</td></tr>
+<tr><td><code>fi_mr()</code></td><td><code>ibv_mr</code></td><td>内存注册，与 MR 完全对应，也有 lkey/rkey</td></tr>
+<tr><td><code>fi_cq()</code></td><td><code>ibv_cq</code></td><td>完成队列，与 CQ 完全对应</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>libfabric 的一大优势是 <strong>provider 切换</strong>：只需设置环境变量 <code>FI_PROVIDER=tcp</code> 就可以让 RDMA 代码回退到 TCP 模式，方便开发和调试。在生产环境中设置为对应的硬件 provider。</p>
+
+<pre># 使用 TCP provider（开发环境）
+$ export FI_PROVIDER=tcp
+$ ./my_rdma_app
+
+# 使用 EFA provider（AWS）
+$ export FI_PROVIDER=efa
+$ ./my_rdma_app
+
+# 使用 Verbs provider（Mellanox RDMA）
+$ export FI_PROVIDER=verbs;ofi_rxm
+$ ./my_rdma_app</pre>
+
+<h2>UCX：自调优的传输层</h2>
+
+<p>UCX（Unified Communication X）在 libfabric 之上提供更高层次的抽象。它的核心特点是 <strong>自调优传输选择</strong>：</p>
+
+<ul>
+  <li>同一节点内通信 → 使用共享内存（shared memory）传输</li>
+  <li>短消息（小于阈值） → 使用 RC QP SEND/RECV</li>
+  <li>大消息 → 使用 RDMA WRITE 或 RDMA READ</li>
+  <li>控制消息 → 使用 UD（不可靠数据报）</li>
+</ul>
+
+<p>UCX 自动调节这些参数，应用不需要关心底层使用哪种传输机制。UCX 的 <code>ucx_perftest</code> 工具是衡量 RDMA 性能的行业标准。</p>
+
+<h2>高层框架：MPI 与 NCCL</h2>
+
+<p>在 AI 训练和 HPC 领域，最终用户通常不直接接触 libfabric 或 UCX。</p>
+
+<ul>
+  <li><strong>MPI</strong>（Message Passing Interface）— 科学计算的标准并行编程模型。MPI 实现（如 OpenMPI、MPICH）内部使用 UCX 或 libfabric 作为传输后端。</li>
+  <li><strong>NCCL</strong>（NVIDIA Collective Communication Library）— AI 训练中的集合通信库。NCCL 内部直接使用 libfabric 或 raw verbs（根据平台选择）。AllReduce、AllGather 等集合操作通过 RDMA WRITE 实现。</li>
+</ul>
+
+<h2>你在本课程中学到的知识如何复用</h2>
+
+<p>虽然生产代码不直接写 raw verbs，但你在前五课打下的基础在 RDMA 栈的每一层都适用：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>你的知识基础</th><th>生产环境中如何复用</th></tr>
+</thead>
+<tbody>
+<tr><td>MR 注册与 rkey 模型</td><td>libfabric 的 <code>fi_mr</code> 完全遵循同一模式。不管用哪种抽象，内存注册仍然是隐式 pinning + 密钥验证</td></tr>
+<tr><td>CQ 与 WC 完成语义</td><td>UCX 的完成回调、libfabric 的 <code>fi_cq_read</code> 都基于同样的完成模型。poll vs 阻塞的选择也相通</td></tr>
+<tr><td>QP 状态机思考方式</td><td>libfabric 的 <code>fi_ep</code> 也有 enable/disable 状态。连接管理的异步模型与 CM 事件模型一脉相承</td></tr>
+<tr><td>控制面 vs 数据面分离</td><td>这个思维框架是理解任何高性能网络库的关键——分离配置通道和数据通道</td></tr>
+<tr><td>Soft-RoCE 实践</td><td>你用 Soft-RoCE 写的代码可以直接在硬件 RNIC 上运行。只需要更换 provider 并调整性能参数</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>生产中的真实挑战</h2>
+
+<p>用真实 RDMA 硬件运行生产负载时，你还会遇到 Soft-RoCE 环境中不存在的问题：</p>
+
+<ul>
+  <li><strong>PCIe 带宽规划</strong> — 多张 HCA 共享 PCIe root complex 时可能出现带宽争抢。需要配合 NUMA 拓扑仔细规划</li>
+  <li><strong>无损网络配置</strong> — RoCEv2 需要 PFC（优先级流控）和 ECN（显式拥塞通知）来避免丢包。配置错误会导致 RDMA 性能急剧下降</li>
+  <li><strong>多路（Multi-rail）</strong> — 大型集群中每个节点有多个 HCA，需要负载均衡和故障转移</li>
+  <li><strong>rkey 安全管理</strong> — MR 的 <code>rkey</code> 相当于远程内存访问的密码。生产中对 rkey 的分发、旋转和回收需要严格管理</li>
+  <li><strong>资源隔离</strong> — Linux cgroup <code>rdma</code> controller 可以限制每个 cgroup 的 MR 注册量、QP 数量等，防止一个应用耗尽所有 RDMA 资源</li>
+  <li><strong>可观测性</strong> — 硬件计数器：CRC 错误、重传率、RNR 超时次数、PCIe 链路错误。ethtool、ibstat、perftest 等工具的使用</li>
+</ul>
+
+<h2>结语</h2>
+
+<p>恭喜你完成了全部六课的学习！让我们回顾一下整条路径：</p>
+
+<ol>
+  <li><strong>从 DMA 到 RDMA</strong> — DMA 是数据卸载的起点，RDMA 将其扩展到远端</li>
+  <li><strong>设备发现与环境</strong> — 找到 RDMA 设备，配置 Soft-RoCE，完成第一次通信</li>
+  <li><strong>核心对象模型</strong> — Context、PD、MR、CQ、QP 五个对象及其生命周期</li>
+  <li><strong>数据路径深入</strong> — 控制面与数据面分离，SEND 和 WRITE 的完整数据流</li>
+  <li><strong>连接模型</strong> — 手工 TCP + raw verbs 和 RDMA CM 两种连接方式</li>
+  <li><strong>走向生产</strong> — 生产 RDMA 栈的层次和你的知识如何复用</li>
+</ol>
+
+<p>现在，你可以带着这些知识进入实验环节，亲手实现一个完整的 RDMA 通信程序。本课程的 6 个实验（Lab 01 ~ Lab 06）与这六课一一对应，每个实验都包含 starter 代码、验收测试和反思题。祝学习愉快！</p>
+
+<div class="callout note">
+<strong>进一步学习</strong>
+如果你希望深入探索，参考讲义（<code>reference/</code> 目录）包含了术语表、数据路径、Verbs 生命周期、QP 状态机、内存注册、CM 状态机、性能方法论、生产生态和故障诊断等专题的详细讲解。它们是本课程的最佳扩展阅读。
+</div>
+
+<footer class="footer">
+  <nav><a href="0005-connection-models.html">← 上一课</a><a href="index.html">课时列表</a><a href="../reference/index.html">参考讲义 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

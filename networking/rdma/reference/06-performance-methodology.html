@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>06 · RDMA 性能测量方法论 — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html" class="active">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+<main class="main">
+<h1>RDMA 性能测量方法论</h1>
+<p class="subtitle">延迟、带宽、queue depth、signaled 策略与 Soft-RoCE/TCG 的可信边界</p>
+
+<h2>测量对象</h2>
+<p>RDMA 性能测量不能只看 "延迟" 或 "带宽" 单一指标。不同应用关注的维度截然不同：</p>
+<table>
+  <thead>
+    <tr>
+      <th>指标</th>
+      <th>典型范围</th>
+      <th>测量方法</th>
+      <th>应用关注</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Latency（延迟）</td>
+      <td>1-10 μs（硬件）；10-100 μs（Soft-RoCE）</td>
+      <td>Ping-pong（收发各一次，取半往返）；或者 WRITE_WITH_IMM 单边测量</td>
+      <td>高频交易、分布式锁、日志提交</td>
+    </tr>
+    <tr>
+      <td>Bandwidth（带宽）</td>
+      <td>12-200 Gbps（取决于硬件链路）</td>
+      <td>RDMA WRITE 或 RDMA READ 大消息（≥1 MB）持续吞吐</td>
+      <td>存储（NVMe-oF）、数据备份、批处理</td>
+    </tr>
+    <tr>
+      <td>IOPS（消息速率）</td>
+      <td>1M-100M msg/s</td>
+      <td>短消息（64 字节）持续发送，统计完成数量</td>
+      <td>键值存储、消息队列、RPC 框架</td>
+    </tr>
+    <tr>
+      <td>CPU 利用率</td>
+      <td>&lt;10% 典型硬件；50-100% Soft-RoCE</td>
+      <td><code>perf stat</code> 统计 cycles/byte、IPC、context-switches</td>
+      <td>云环境、功耗敏感场景</td>
+    </tr>
+    <tr>
+      <td>Tail Latency（尾部延迟）</td>
+      <td>p99 &lt; 3x 平均；p99.9 &lt; 10x 平均</td>
+      <td>大量重复测试，排序取百分位数</td>
+      <td>SLA 保障、延迟敏感服务</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>关键参数</h2>
+<p>RDMA 基准测试的各个参数相互耦合，理解其影响对正确解读结果至关重要：</p>
+
+<table>
+  <thead>
+    <tr>
+      <th>参数</th>
+      <th>扫描范围</th>
+      <th>影响</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>Message Size（消息大小）</td>
+      <td>64 B → 1 MB+（按 2x 递增）</td>
+      <td>小消息（&lt; 256 B）测试消息率；大消息（&gt; 64 KB）测试带宽。InfiniBand MTU 典型 4 KB，超过 MTU 需分段。</td>
+    </tr>
+    <tr>
+      <td>Queue Depth（队列深度）</td>
+      <td>1, 4, 16, 64, 128</td>
+      <td>深度 1 测量原始延迟；深度增大允许 HCA 流水线化，提升带宽利用率。过深可能导致 RNR 重试。</td>
+    </tr>
+    <tr>
+      <td>Signaled vs Unsignaled</td>
+      <td>全部 signaled / 选择性 signaled</td>
+      <td>每个 signaled WR 产生 CQE，消耗 CQ 带宽。选择性 signaled（每 N 个 WR 发送一个 signaled）可大幅降低 CQ 压力。</td>
+    </tr>
+    <tr>
+      <td>Inline</td>
+      <td>启用/禁用</td>
+      <td>小消息（≤ 发送队列的 max_inline_data）直接嵌入 WQE，避免 HCA 从内存 DMA 读取，降低延迟和内存带宽消耗。</td>
+    </tr>
+    <tr>
+      <td>CPU Affinity</td>
+      <td>taskset -c N / isolcpus</td>
+      <td>将进程绑定到 HCA 所在的 NUMA 节点，避免跨 NUMA 访问引入额外延迟。isolcpus 隔离 CPU，避免调度抖动。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>工具矩阵</h2>
+<p><strong>perftest</strong> 是 rdma-core 自带的官方基准测试套件，覆盖主流操作：</p>
+<table>
+  <thead>
+    <tr>
+      <th>命令</th>
+      <th>测量内容</th>
+      <th>典型用法</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>ib_send_lat</code></td>
+      <td>双向 SEND 延迟（ping-pong 半往返）</td>
+      <td><code>ib_send_lat -a -d rxe0 -s 64 -n 10000</code></td>
+    </tr>
+    <tr>
+      <td><code>ib_write_bw</code></td>
+      <td>RDMA WRITE 带宽</td>
+      <td><code>ib_write_bw -a -d rxe0 --report_gbits -q 64</code></td>
+    </tr>
+    <tr>
+      <td><code>ib_read_bw</code></td>
+      <td>RDMA READ 带宽</td>
+      <td><code>ib_read_bw -a -d rxe0 --report_gbits -q 64</code></td>
+    </tr>
+    <tr>
+      <td><code>ib_send_bw</code></td>
+      <td>SEND 消息率</td>
+      <td><code>ib_send_bw -a -d rxe0 -s 16 -q 128</code></td>
+    </tr>
+  </tbody>
+</table>
+<p>重要参数说明：</p>
+<ul>
+  <li><code>-s size</code>：消息大小（字节），必须服务端和客户端一致。</li>
+  <li><code>-n iterations</code>：迭代次数，影响统计稳定性。建议 ≥ 10000。</li>
+  <li><code>-q depth</code>：预 posted 的 WR 数量（queue depth）。</li>
+  <li><code>--report_gbits</code>：以 Gbps 显示带宽，非默认 MB/s。</li>
+  <li><code>-a</code>：自动判断设备，避免手动指定 GID。</li>
+</ul>
+<p>辅助工具：</p>
+<ul>
+  <li><code>perf stat ./ib_write_bw ...</code>：采集 cycles, instructions, IPC, cache-misses, context-switches。</li>
+  <li><code>rdma statistic</code>：查看 per-QP 的发送/接收字节数、错误计数。</li>
+  <li><code>tcpdump -i eth0 udp port 4791</code>：捕获 RoCEv2 流量，验证报文大小和重传。</li>
+</ul>
+
+<h2>实验设计</h2>
+<p>一份可信的 RDMA 性能报告必须遵循严格的实验规范：</p>
+<ol>
+  <li><strong>Warmup</strong>：前 N 次迭代丢弃（一般 ≥ 3 次）。RDMA 路径有初次运行时缓存未命中（TLB、页表缓存）和代码路径预热的冷启动效应。</li>
+  <li><strong>Repetitions</strong>：每个数据点至少 5 次独立运行，报告均值 ± 标准差。单次运行不可信。</li>
+  <li><strong>Randomization</strong>：如果需要扫描 size 序列，随机打乱扫描顺序，避免系统性的缓存或调度倾斜。或者使用双循环（先随机扫描再顺序确认）。</li>
+  <li><strong>Steady State vs Transient</strong>：测量持续 10 秒以上的稳态吞吐。系统在刚启动时有瞬时高延迟（调度器、中断合并调整）。瞬态测量结果不应混入稳态报告。</li>
+  <li><strong>背景噪声控制</strong>：关闭 cron、日志轮转、监控 agent、NTP 同步等周期性任务。在隔离的 CPU 上运行（<code>isolcpus</code> 内核参数）。</li>
+</ol>
+<pre><code># 评估用实验脚本片段（bash）：
+for size in 64 128 256 512 1024 2048 4096 8192 16384 32768 65536 131072; do
+    for run in $(seq 1 5); do
+        ib_write_bw -a -d rxe0 -s $size -q 64 -n 10000 2>/dev/null \
+            | tail -1 &gt;&gt; bw_size${size}_run${run}.dat
+        sleep 1   # 让 HCA 和系统回归稳态
+    done
+done</code></pre>
+
+<h2>Soft-RoCE/TCG 局限</h2>
+<div class="callout warn">
+  <strong>重要警告：</strong>Soft-RoCE（RXE）和 TCG（QEMU 内部的虚拟 RDMA）的数值<strong>绝对不能</strong>用来推断或推测真实硬件 RDMA 的性能。以下列出其根本差异——每一个都导致测量值偏离硬件几个数量级。
+</div>
+<table>
+  <thead>
+    <tr>
+      <th>方面</th>
+      <th>硬件 RDMA</th>
+      <th>Soft-RoCE / TCG</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>数据路径</td>
+      <td>HCA 硬件 DMA，数据不经过 CPU</td>
+      <td>CPU 执行 memcpy() 模拟 DMA。每个字节都由 CPU 搬运一遍。</td>
+    </tr>
+    <tr>
+      <td>延迟</td>
+      <td>1-3 μs（单跳）</td>
+      <td>20-200 μs（受 CPU 频率、内核抢占影响）。TCG 中每增加一层虚拟化增加 50-100 μs。</td>
+    </tr>
+    <tr>
+      <td>带宽</td>
+      <td>12-200 Gbps（线速）</td>
+      <td>受限于主机内存带宽的 1-5 Gbps（甚至更低，因单线程 memcpy 模型）。TCG 中因额外指令翻译进一步折半。</td>
+    </tr>
+    <tr>
+      <td>Queue Depth 效果</td>
+      <td>增大 QD 显著提升吞吐</td>
+      <td>QD 增大不显著提升吞吐，因为所有操作在 CPU 上串行化。</td>
+    </tr>
+    <tr>
+      <td>CPU 利用率</td>
+      <td>&lt; 5% CPU 用于数据面</td>
+      <td>100% 单核满载（RXE 的 ksoftirqd 或 TCG 的 QEMU I/O 线程）。</td>
+    </tr>
+    <tr>
+      <td>尾延迟</td>
+      <td>稳定可控</td>
+      <td>高方差：受调度器、中断、宿主机负载大幅影响。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>报告规范</h2>
+<p>一份可复现的性能报告必须包含完整的<strong>环境信息</strong>：</p>
+<pre><code>## 系统信息
+- OS: Ubuntu 22.04.3 LTS (kernel 6.2.0-26-generic)
+- rdma-core: v48.0 (git: v48.0-4-g1234abcd)
+- CPU: Intel Xeon Gold 6338 @ 2.0 GHz (28C/56T)
+- Memory: 512 GB DDR4-3200 (8 channels)
+- NIC: Mellanox ConnectX-6 Dx (dual-port 100 Gbps)
+- Firmware: 28.38.2002 (MT_0000000812)
+- MTU: 4096 (IB link) / 9000 (RoCE eth)
+
+## 测试配置
+- QP Type: RC
+- Access Flags: LOCAL_WRITE | REMOTE_WRITE
+- Inline: enabled (max_inline_data = 64)
+- Selective Signaling: every 16 WRs
+- CPU Affinity: taskset -c 8-15 (NUMA node 0, same as NIC)
+- Background: isolcpus=8-15, no cron/system services
+- Iterations: 10000 (after 1000 warmup)
+- Repeats: 5 per data point</code></pre>
+<p>不同测量目的的区别：</p>
+<ul>
+  <li><strong>Functional Verification（功能验证）</strong>：确认代码无错误、路径通。用默认参数跑即可，不追求统计显著。</li>
+  <li><strong>Micro-benchmark（微基准）</strong>：在最优配置下测得硬件上限。使用大页、绑核、隔离 CPU、优化参数。</li>
+  <li><strong>Production Load（生产负载）</strong>：在接近生产环境的配置下测量——有背景噪声、非最优参数、真实消息分布。结果才是对业务有意义的参考值。</li>
+</ul>
+<p><strong>永远不要</strong>将 Soft-RoCE 或 TCG 的性能数据外推到硬件 RDMA。如果在软件模拟器上跑了 1 μs 延迟 100 Gbps 带宽，那测试环境或测试方法一定有问题。</p>
+
+<footer class="footer">
+  <nav><a href="05-rdma-cm-state-machine.html">← 上一页</a><a href="index.html">门户</a><a href="07-production-ecosystem.html">下一页 →</a></nav>
+</footer>
+</main>
+</body>
+</html>

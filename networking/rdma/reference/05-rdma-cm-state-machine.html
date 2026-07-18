@@ -1,0 +1,271 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>05 · RDMA CM 状态机 — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html" class="active">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+<main class="main">
+<h1>RDMA CM 状态机</h1>
+<p class="subtitle">地址解析、路由解析、连接建立与断开的异步事件模型</p>
+
+<h2>为什么需要 RDMA CM</h2>
+<p>Raw verbs 提供了对 HCA 硬件的完全控制权，但它不处理任何<strong>网络层</strong>任务：</p>
+<ul>
+  <li>地址解析：将目标主机名或 IP 地址转换为 RDMA 设备可理解的 GID（Global Identifier）。</li>
+  <li>路由解析：确定从本机到目标 Node 的路径——在 InfiniBand 子网中，这涉及 SM（Subnet Manager）查询和路径记录。</li>
+  <li>连接建立：为 RC（Reliable Connection）QP 完成握手——交换 QPN、PSN、MTU 等参数。</li>
+  <li>断开通知：监听并报告对端断开、设备移除等异常。</li>
+  <li>多播（Multicast）：加入/离开 InfiniBand 或 RoCE 的多播组。</li>
+</ul>
+<p><strong>librdmacm</strong> 封装了上述逻辑，提供类似 TCP socket 的编程模型。它基于 <code>libibverbs</code> 构建，自身不管理数据传输——只管理连接状态。数据面仍由 raw verbs（<code>ibv_post_send</code> / <code>ibv_post_recv</code>）完成。</p>
+
+<h2>核心对象</h2>
+<table>
+  <thead>
+    <tr>
+      <th>对象</th>
+      <th>类型</th>
+      <th>说明</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>rdma_event_channel</code></td>
+      <td><code>struct rdma_event_channel *</code></td>
+      <td>异步事件投递通道。所有 CM 事件（连接请求、建立、断开等）都通过此 channel 传递给用户。其 <code>fd</code> 字段可被 <code>poll</code> / <code>select</code> 监听。</td>
+    </tr>
+    <tr>
+      <td><code>rdma_cm_id</code></td>
+      <td><code>struct rdma_cm_id *</code></td>
+      <td>连接标识符，相当于 socket fd + 本地 fabric 端口的组合。封装了底层的 QP（若有）。每个 cm_id 绑定一个事件 channel。</td>
+    </tr>
+    <tr>
+      <td><code>rdma_create_ep</code></td>
+      <td>辅助函数</td>
+      <td>简化创建流程：<code>rdma_create_ep</code> 内部创建 channel + id + 绑定，一步到位。适用于不需要精细控制的事件驱动的应用。</td>
+    </tr>
+    <tr>
+      <td><code>rdma_getaddrinfo</code></td>
+      <td>辅助函数</td>
+      <td>类似 <code>getaddrinfo(3)</code>，返回 <code>struct rdma_addrinfo</code>，包含源地址、目标地址以及源 RDMA 设备信息。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>Server 事件序列</h2>
+<div class="state-machine">
+<pre><code>1. chan = rdma_create_event_channel()
+2. id = rdma_create_id(chan, ...)
+3. rdma_bind_addr(id, bind_addr)
+4. rdma_listen(id, backlog)
+5. chan 上等待 CONNECT_REQUEST 事件
+6. rdma_get_cm_event(chan, &amp;event)       ← CONNECT_REQUEST
+7. rdma_create_qp(id, pd, ...)           ← 为连接创建 QP
+8. rdma_accept(child_id, ...)
+9. chan 上等待 ESTABLISHED 事件
+10. rdma_get_cm_event(chan, &amp;event)      ← ESTABLISHED
+11. 数据传输（ibv_post_send / ibv_post_recv）
+12. rdma_disconnect(id)
+13. chan 上等待 DISCONNECTED 事件
+14. rdma_get_cm_event(chan, &amp;event)      ← DISCONNECTED
+15. 清理：rdma_destroy_qp → rdma_destroy_id → rdma_destroy_event_channel</code></pre>
+</div>
+<p>关键细节：</p>
+<ul>
+  <li><code>rdma_listen</code> 的 <code>backlog</code> 参数类似 TCP listen backlog，控制未完成 accept 连接的队列深度。</li>
+  <li>CONNECT_REQUEST 事件返回的 <code>child_id</code> 是一个新的 cm_id，需为其创建独立的 QP。</li>
+  <li><code>rdma_accept</code> 可附带 <code>rdma_conn_param</code>：设置 <code>initiator_depth</code>、<code>responder_resources</code>、<code>rnr_retry_count</code> 等。</li>
+  <li>每个事件必须通过 <code>rdma_ack_cm_event</code> 确认（ack），否则后续事件不会到达。</li>
+</ul>
+
+<h2>Client 事件序列</h2>
+<div class="state-machine">
+<pre><code>1. chan = rdma_create_event_channel()
+2. id = rdma_create_id(chan, ...)
+3. rdma_resolve_addr(id, src, dst, timeout_ms)  ← 地址解析
+4. chan 上等待 ADDR_RESOLVED 事件
+5. rdma_get_cm_event(chan, &amp;event)              ← ADDR_RESOLVED
+6. rdma_resolve_route(id, timeout_ms)            ← 路由解析
+7. chan 上等待 ROUTE_RESOLVED 事件
+8. rdma_get_cm_event(chan, &amp;event)              ← ROUTE_RESOLVED
+9. rdma_create_qp(id, pd, ...)
+10. rdma_connect(id, conn_param, ...)
+11. chan 上等待 ESTABLISHED 事件
+12. rdma_get_cm_event(chan, &amp;event)             ← ESTABLISHED
+13. 数据传输
+14. rdma_disconnect(id)
+15. chan 上等待 DISCONNECTED 事件
+16. rdma_get_cm_event(chan, &amp;event)             ← DISCONNECTED
+17. 清理</code></pre>
+</div>
+<p>客户端必须<strong>先完成地址和路由解析</strong>，再创建 QP 和发起连接——这与 TCP 的 <code>connect(2)</code> 不同，因为 RDMA 需要预先知道出向接口和路径 MTU。</p>
+
+<div class="callout note">
+  <strong>推荐实践：</strong>使用 <code>rdma_getaddrinfo</code> 替代手动填充地址信息。它自动处理 IPv4/IPv6 → GID 转换、查找正确的 RDMA 设备并填充源地址。设置 <code>hints.ai_port_space = RDMA_PS_TCP</code> 用于 RC 连接。
+</div>
+
+<h2>错误事件</h2>
+<table>
+  <thead>
+    <tr>
+      <th>事件</th>
+      <th>原因</th>
+      <th>排查方向</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td><code>ADDR_ERROR</code></td>
+      <td><code>rdma_resolve_addr</code> 失败——主机名无法解析、源地址不属于任何 RDMA 设备、目标地址不可达。</td>
+      <td>检查主机名/DNS 配置；确认 RDMA 设备存在且端口 UP；用 <code>ibv_devinfo</code> 查看设备。</td>
+    </tr>
+    <tr>
+      <td><code>ROUTE_ERROR</code></td>
+      <td><code>rdma_resolve_route</code> 失败——子网中无有效路径，或超出子网范围。</td>
+      <td>检查 <code>ip route</code>；确认两台机器在同一 IB 分区（InfiniBand P_Key）；确认 SM 运行正常。</td>
+    </tr>
+    <tr>
+      <td><code>CONNECT_ERROR</code></td>
+      <td>连接建立阶段失败——QPN/PSN 协商失败，或对端拒绝连接。</td>
+      <td>检查防火墙是否放行 CM 端口（默认端口 3891 或 RoCE 的 UDP 4791）；确认对端在 listen。</td>
+    </tr>
+    <tr>
+      <td><code>UNREACHABLE</code></td>
+      <td>对端网络不可达——可能是底层链路故障。</td>
+      <td>用 <code>ibping</code> 测试 InfiniBand 可达性；检查链路层状态（<code>ibstat</code> 确认 <code>LinkUp</code>）。</td>
+    </tr>
+    <tr>
+      <td><code>REJECTED</code></td>
+      <td>对端主动拒绝连接——端口未监听或 conn_param 参数不匹配。</td>
+      <td>确认对端 <code>rdma_listen</code> 已调用且端口正确；<code>ss -tlnp</code> 查 CM 端口。</td>
+    </tr>
+    <tr>
+      <td><code>DEVICE_REMOVAL</code></td>
+      <td>HCA 设备被热拔出或驱动卸载。</td>
+      <td>通知应用层做优雅关闭，释放所有资源。</td>
+    </tr>
+  </tbody>
+</table>
+
+<h2>超时管理</h2>
+<p>RDMA CM 的地址和路由解析支持显式超时：</p>
+<pre><code>int ret = rdma_resolve_addr(id, src, dst, 2000);   /* 2 秒超时 */
+if (ret) { perror("rdma_resolve_addr"); exit(1); }</code></pre>
+<p>但 CM 自身不提供通用的 "连接超时" 机制——<code>rdma_connect</code> 本身不会超时。你必须使用 <code>poll</code> 或 <code>select</code> 在事件 channel 的 fd 上监听：</p>
+<pre><code>struct pollfd pfd = { .fd = chan-&gt;fd, .events = POLLIN };
+int n = poll(&amp;pfd, 1, 5000);   /* 5 秒整体超时 */
+if (n == 0) {
+    fprintf(stderr, "连接超时\n");
+    rdma_disconnect(id);
+    goto cleanup;
+}
+/* 有事件到达，调用 rdma_get_cm_event */</code></pre>
+<p>常见超时策略：</p>
+<ul>
+  <li><strong>地址解析</strong>：3-5 秒。失败一般是配置错误。</li>
+  <li><strong>路由解析</strong>：3-5 秒。失败可能是网络拓扑变化。</li>
+  <li><strong>连接建立</strong>：10-30 秒。取决于对端状态和网络延迟。</li>
+  <li><strong>断开等待</strong>：3-5 秒。对端可能不会立即响应。</li>
+</ul>
+
+<h2>清理规则</h2>
+<p>RDMA CM 资源清理必须遵循严格的顺序，否则会导致资源泄漏或 panic：</p>
+<ol>
+  <li><strong>每个 CM 事件必须 ack</strong>：调用 <code>rdma_ack_cm_event</code> 释放内核事件队列空间。未 ack 的事件会阻塞后续事件投递。</li>
+  <li><strong>先销毁 QP，再销毁 cm_id</strong>：<code>rdma_destroy_qp(cm_id)</code> 必须在 <code>rdma_destroy_id(cm_id)</code> 之前。因为 destroy_id 会尝试在清理硬件资源时引用 QP。</li>
+  <li><strong>先销毁 cm_id，再销毁 event channel</strong>：event channel 上可能还有未处理事件，先销毁 cm_id 可确保事件队列被 drain。</li>
+  <li><strong>幂等清理</strong>：始终检查指针为空再调用 destroy 函数，并在 destroy 后将指针置 NULL：</li>
+</ol>
+<pre><code>if (qp) { rdma_destroy_qp(qp); qp = NULL; }
+if (cm_id) { rdma_destroy_id(cm_id); cm_id = NULL; }
+if (chan) { rdma_destroy_event_channel(chan); chan = NULL; }</code></pre>
+
+<div class="callout note">
+  <strong>调试技巧：</strong>如果在清理时报 <code>ENOMEM</code> 或 <code>EBUSY</code>，通常是事件未 ack 或 QP 仍在活动状态。用 <code>rdma resource show</code> 查看残留的 QP 和 CM_ID。
+</div>
+
+<h2>CM vs 手工 TCP</h2>
+<p>在 <code>lab 01</code> 中，我们用手工搭建 TCP 连接交换 QPN/PSN/GID。CM 将此过程自动化：</p>
+<table>
+  <thead>
+    <tr>
+      <th>方面</th>
+      <th>手工 TCP 方式</th>
+      <th>RDMA CM</th>
+    </tr>
+  </thead>
+  <tbody>
+    <tr>
+      <td>地址解析</td>
+      <td>手动配置 GID、IP 地址</td>
+      <td><code>rdma_resolve_addr</code> + <code>rdma_getaddrinfo</code></td>
+    </tr>
+    <tr>
+      <td>路由解析</td>
+      <td>不处理</td>
+      <td><code>rdma_resolve_route</code> 自动查询路径</td>
+    </tr>
+    <tr>
+      <td>连接握手</td>
+      <td>自定义 TCP 协议交换 QPN/PSN</td>
+      <td>CM 内核模块处理握手协议</td>
+    </tr>
+    <tr>
+      <td>错误处理</td>
+      <td>需自行解析断开原因</td>
+      <td>结构化的事件类型（REJECTED, UNREACHABLE 等）</td>
+    </tr>
+    <tr>
+      <td>多播</td>
+      <td>不支持</td>
+      <td><code>rdma_join_multicast</code> / <code>rdma_leave_multicast</code></td>
+    </tr>
+  </tbody>
+</table>
+<p>CM 的内部实现因链路层而异：</p>
+<ul>
+  <li><strong>InfiniBand</strong>：通过内核 CM 模块（<code>ib_cm</code>）使用 InfiniBand 的 CM 协议做 REQ/REP/RTU 三次握手。</li>
+  <li><strong>RoCE</strong>：通过 <code>rping</code> 风格在 IP 上封装 CM 消息，本质是 TCP + RoCE 地址交换。</li>
+  <li><strong>iWARP</strong>：通过 MPA（Marker PDU Aligned framing）协商连接。</li>
+</ul>
+
+<footer class="footer">
+  <nav><a href="04-memory-registration-and-rkey.html">← 上一页</a><a href="index.html">门户</a><a href="06-performance-methodology.html">下一页 →</a></nav>
+</footer>
+</main>
+</body>
+</html>

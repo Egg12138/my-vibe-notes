@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第一课 · 从 DMA 到 RDMA — RDMA 课程</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 课程课件</a></h2>
+  <nav>
+    <div class="section-label">课时</div>
+    <ul>
+      <li><a href="0001-dma-to-rdma.html" class="active">01 · 从 DMA 到 RDMA</a></li>
+      <li><a href="0002-device-and-env.html">02 · 设备发现与环境</a></li>
+      <li><a href="0003-core-objects.html">03 · 核心对象模型</a></li>
+      <li><a href="0004-data-path.html">04 · 数据路径深入</a></li>
+      <li><a href="0005-connection-models.html">05 · 连接模型</a></li>
+      <li><a href="0006-to-production.html">06 · 走向生产</a></li>
+    </ul>
+    <div class="section-label">参考</div>
+    <ul>
+      <li><a href="../reference/lab-guide.html">实验指导</a></li>
+      <li><a href="../reference/index.html">参考讲义</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>第一课 · 从 DMA 到 RDMA</h1>
+<p class="subtitle">理解 DMA 的基本概念，以及 RDMA 如何将 DMA 扩展到远端</p>
+
+<h2>什么是 DMA？</h2>
+
+<p>DMA（Direct Memory Access，直接内存访问）是一种硬件机制，允许外设（如磁盘控制器、网卡、声卡）<strong>绕过 CPU</strong>，直接读写系统内存。</p>
+
+<p>在没有 DMA 的时代，每次设备数据传输都需要 CPU 参与：CPU 从设备读取一个字节，再把它写入内存。这种方式称为 PIO（Programmed I/O）。当数据量小时还可以接受，但在高速网络或磁盘场景下，CPU 会被完全占满，无力处理应用逻辑。</p>
+
+<p>DMA 控制器接管了数据搬运工作：CPU 只需要告诉 DMA 控制器"从哪里读、写到哪里、多少数据"，然后就可以去处理其他任务。DMA 控制器完成传输后通过中断通知 CPU。</p>
+
+<div class="callout note">
+<strong>关键认识</strong>
+DMA 的本质是让数据传输操作从 CPU 卸载到专用硬件。这个思想也是 RDMA 的基石——只不过 RDMA 把范围从"本地设备 ↔ 本地内存"扩展到了"远端设备 ↔ 本地内存"。
+</div>
+
+<h2>DMA 的局限：只能在本机</h2>
+
+<p>传统 DMA 的传输范围被限制在 PCIe 总线内部。当数据需要跨越网络时，CPU 仍然必须介入：</p>
+
+<ol>
+  <li>NIC 通过 DMA 将网络数据写入内核缓冲区</li>
+  <li>CPU 将数据从内核缓冲区拷贝到用户缓冲区（一次 <code>read()</code> 系统调用）</li>
+  <li>CPU 处理数据</li>
+  <li>CPU 将数据从用户缓冲区拷贝到内核缓冲区（一次 <code>write()</code> 系统调用）</li>
+  <li>NIC 通过 DMA 从内核缓冲区读取并发送</li>
+</ol>
+
+<p>即使 NIC 使用了 DMA，数据在用户态和内核态之间的两次拷贝（以及对应的上下文切换）仍然会消耗大量 CPU 周期，增加延迟。这被称为 <strong>数据搬运瓶颈</strong>。</p>
+
+<h2>RDMA 的创新</h2>
+
+<p>RDMA（Remote Direct Memory Access）从根本上改变了数据路径。核心思想是：<strong>让远端 NIC 可以直接读写本机的内存</strong>，不需要本机 CPU 参与数据传输过程。</p>
+
+<p>RDMA 与传统 socket 通信有三个根本区别：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>特性</th><th>传统 Socket</th><th>RDMA</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>零拷贝</strong></td><td>数据在用户缓冲区和内核缓冲区之间至少拷贝两次</td><td>NIC 直接从用户缓冲区 DMA 读取/写入，无需内核中转</td></tr>
+<tr><td><strong>内核旁路</strong></td><td>每次 send/recv 都是系统调用，涉及上下文切换</td><td>数据面操作（post_send）通过 MMIO doorbell，无系统调用</td></tr>
+<tr><td><strong>单边操作</strong></td><td>远端 CPU 必须参与每次 recv 系统调用</td><td>RDMA WRITE/READ 完全绕过远端 CPU，对端 CPU 零感知</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>深入理解 "零拷贝"</h3>
+
+<p>零拷贝不是说数据没有被拷贝，而是 <strong>不需要通过 CPU 做额外的中间拷贝</strong>。在 RDMA 中，数据只经过一条路径：应用缓冲区 ↔ NIC（通过 DMA 引擎）。而在传统 socket 中，数据路径是：应用缓冲区 → 内核 socket 缓冲区 → NIC，两次拷贝至少有一次由 CPU 完成。</p>
+
+<h2>"Remote" 的含义</h2>
+
+<p>RDMA 中的 "R"（Remote）指的是：<strong>远端 HCA（Host Channel Adapter）可以直接访问本地内存</strong>。</p>
+
+<p>具体来说，当一个远端机器发起 RDMA WRITE 操作时：</p>
+<ol>
+  <li>远端 HCA 读取自身内存中的数据</li>
+  <li>远端 HCA 将数据打包成网络包</li>
+  <li>数据到达本机后，<strong>本机 HCA 直接将 payload 写入本机内存</strong></li>
+  <li>本机 CPU <strong>从未参与</strong> 数据写入过程</li>
+</ol>
+
+<p>这是"远程 DMA"的真正含义：DMA 操作的目标地址在远端机器上，但数据搬运由本地 HCA 主动完成。</p>
+
+<h2>四种 RDMA 传输实现</h2>
+
+<p>RDMA 不是一个单一的协议，而是一族技术的统称。以下是主要的实现方式：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>实现</th><th>传输层</th><th>特点</th><th>硬件要求</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>InfiniBand</strong></td><td>原生 IB 协议</td><td>无损 Fabric，原生 RDMA，最低延迟。有自己的物理层、链路层、网络层和传输层</td><td>专用 IB HCA 和 IB 交换机</td></tr>
+<tr><td><strong>RoCEv2</strong></td><td>UDP/IP</td><td>RDMA over Converged Ethernet，基于 UDP 封装（目的端口 4791）。需要无损以太网（PFC/ECN）支持</td><td>支持 RoCE 的以太网网卡</td></tr>
+<tr><td><strong>iWARP</strong></td><td>TCP</td><td>RDMA over TCP，可以在任何 IP 网络上运行。由 OS 提供传输层可靠性</td><td>支持 iWARP 的网卡</td></tr>
+<tr><td><strong>Soft-RoCE (RXE)</strong></td><td>UDP/IP（软件）</td><td>纯软件实现，内核模块模拟 RNIC 行为。没有 DMA 卸载，使用 memcpy + 内核网络栈</td><td>不需要专用硬件，任何 Linux 机器即可</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>为什么本课程使用 Soft-RoCE</h2>
+
+<p>Soft-RoCE（也称为 RXE）是 Linux 内核中的一个纯软件 RDMA 实现。它通过内核模块模拟 RNIC 的行为，使用 UDP socket 封装 RDMA 协议。虽然它没有硬件 DMA 引擎带来的性能优势，但 <strong>RDMA 编程语义（Verbs API、MR 注册、QP 状态机、CQ 轮询等）与硬件 RNIC 完全一致</strong>。</p>
+
+<p>选择 Soft-RoCE 的理由：</p>
+<ul>
+  <li><strong>零硬件依赖</strong>：任何一台 Linux 机器都可以运行，甚至可以用在两台虚拟机之间</li>
+  <li><strong>语义一致</strong>：学的就是标准 Verbs API，代码不经修改即可运行在真实 RNIC 上</li>
+  <li><strong>可调试</strong>：数据路径在内核中，可以通过 ftrace、tcpdump 等手段观察每个包的流转</li>
+  <li><strong>实验友好</strong>：本课程的 QEMU 实验环境内置了 RXE 模块</li>
+</ul>
+
+<div class="callout">
+<strong>学习路线图</strong>
+下一课我们将学习如何发现 RDMA 设备、查看设备属性，并用 <code>rping</code> 完成你的第一个 RDMA 通信。动手之前，先确保你的 Linux 系统上加载了 <code>rdma_rxe</code> 内核模块。
+</div>
+
+<footer class="footer">
+  <nav><a href="index.html">← 返回课时列表</a><a href="index.html">课时列表</a><a href="0002-device-and-env.html">下一课 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

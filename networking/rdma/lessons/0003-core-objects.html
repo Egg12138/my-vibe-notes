@@ -1,0 +1,190 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>第三课 · Verbs 核心对象模型 — RDMA 课程</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 课程课件</a></h2>
+  <nav>
+    <div class="section-label">课时</div>
+    <ul>
+      <li><a href="0001-dma-to-rdma.html">01 · 从 DMA 到 RDMA</a></li>
+      <li><a href="0002-device-and-env.html">02 · 设备发现与环境</a></li>
+      <li><a href="0003-core-objects.html" class="active">03 · 核心对象模型</a></li>
+      <li><a href="0004-data-path.html">04 · 数据路径深入</a></li>
+      <li><a href="0005-connection-models.html">05 · 连接模型</a></li>
+      <li><a href="0006-to-production.html">06 · 走向生产</a></li>
+    </ul>
+    <div class="section-label">参考</div>
+    <ul>
+      <li><a href="../reference/lab-guide.html">实验指导</a></li>
+      <li><a href="../reference/index.html">参考讲义</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>第三课 · Verbs 核心对象模型</h1>
+<p class="subtitle">深入理解 RDMA Verbs 编程模型中的五个核心对象及其生命周期</p>
+
+<h2>从文件 I/O 理解 RDMA 对象</h2>
+
+<p>如果你熟悉文件 I/O，可以类比理解 RDMA 对象模型。这种类比虽然不完全精确，但对初学者是非常好的思维脚手架：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>RDMA 对象</th><th>文件 I/O 类比</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>ibv_context</code></td><td>文件描述符（<code>fd</code>）</td><td>与 RDMA 设备交互的根句柄，创建其他所有对象的前提</td></tr>
+<tr><td><code>ibv_pd</code></td><td>文件系统命名空间</td><td>资源隔离边界，MR 和 QP 必须属于同一个 PD 才能互访</td></tr>
+<tr><td><code>ibv_mr</code></td><td><code>mmap</code> 映射区域</td><td>注册后的内存区域，附带 lkey/rkey 作为访问凭证</td></tr>
+<tr><td><code>ibv_cq</code></td><td>异步 I/O 完成队列</td><td>存放操作完成通知的环形缓冲区，类似于 Linux AIO 的 <code>io_getevents</code></td></tr>
+<tr><td><code>ibv_qp</code></td><td>socket 描述符</td><td>通信端点，包含发送队列（SQ）和接收队列（RQ）</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>Context（ibv_context）</h2>
+
+<p><code>ibv_context</code> 是设备句柄，通过 <code>ibv_open_device()</code> 获得。每个进程打开同一个设备会获得独立的 context。context 中保存了该进程与该设备交互所需的所有内核状态。</p>
+
+<p>在同一进程中，可以打开多个 context（不同设备），但每个 context 都是独立的——你不能用 context A 创建的 QP 去 context B 的 CQ 上 poll 完成事件。</p>
+
+<h2>Protection Domain（ibv_pd）</h2>
+
+<p><code>ibv_pd</code> 是 RDMA 的访问控制边界。一个 PD 中创建的 MR 只能被同一个 PD 中的 QP 使用。这确保了不同应用或不同租户之间的内存隔离。</p>
+
+<p>可以这样理解：如果进程 A 和进程 B 各自有独立的 PD，进程 A 的 QP 就无法访问进程 B 的内存（即使进程 B 暴露了 rkey），因为它们的 MR 属于不同的 PD。</p>
+
+<h2>Memory Region（ibv_mr）</h2>
+
+<p>要让 RDMA 硬件访问一块内存，必须先注册它。注册过程做了三件事：</p>
+<ol>
+  <li><strong>Pinning（锁定）</strong> — 调用 <code>get_user_pages()</code> 将虚拟地址对应的物理页锁定在内存中，不允许被 swap 出去</li>
+  <li><strong>地址映射</strong> — 建立虚拟地址到物理地址的映射表（PTE），硬件 DMA 引擎需要物理地址</li>
+  <li><strong>生成访问密钥</strong> — <code>lkey</code>（local key）用于本地操作验证，<code>rkey</code>（remote key）发送给远端用于 RDMA READ/WRITE</li>
+</ol>
+
+<p>注册完成后返回 <code>ibv_mr</code> 结构体，其中包含 <code>lkey</code> 和 <code>rkey</code>。</p>
+
+<pre>struct ibv_mr {
+    struct ibv_context *context;  // 所属设备上下文
+    struct ibv_pd *pd;            // 所属保护域
+    void *addr;                   // 缓冲区虚拟地址
+    size_t length;                // 缓冲区长度
+    uint32_t lkey;                // 本地访问密钥
+    uint32_t rkey;                // 远程访问密钥
+};</pre>
+
+<div class="callout warn">
+<strong>注册成本</strong>
+MR 注册是一个昂贵的操作：它涉及页表遍历、物理页锁定、DMA 地址映射建立。在性能敏感的代码中，应该一次性注册大块内存然后重复使用，而不是频繁注册/注销小块内存。生产环境中常用内存池 + 提前注册的策略。
+</div>
+
+<h2>Completion Queue（ibv_cq）</h2>
+
+<p>CQ 是 RDMA 异步完成模型的核心。它本质上是一个内核管理的环形缓冲区，存放 Work Completion（WC）条目。</p>
+
+<p>关键设计：</p>
+<ul>
+  <li><strong>共享</strong>：一个 CQ 可以被多个 QP 共享（SQ 和 RQ 完成事件都投递到同一个 CQ）</li>
+  <li><strong>轮询语义</strong>：<code>ibv_poll_cq(cq, max_wc, wc_array)</code> 是非阻塞的。如果 CQ 为空，返回 0</li>
+  <li><strong>容量</strong>：CQ 的容量必须 >= 所有关联 QP 的 SQ + RQ 深度之和，否则可能溢出</li>
+  <li><strong>顺序保证</strong>：同一 QP 上的 WC 按提交顺序返回，但不同 QP 的 WC 可能交错</li>
+</ul>
+
+<h2>Queue Pair（ibv_qp）</h2>
+
+<p>QP 是 RDMA 通信的核心对象。每个 QP 包含两个独立的队列：</p>
+
+<ul>
+  <li><strong>Send Queue（SQ）</strong> — 存放发送工作请求：SEND、RDMA WRITE、RDMA READ</li>
+  <li><strong>Receive Queue（RQ）</strong> — 存放接收工作请求：仅 RECV</li>
+</ul>
+
+<p>QP 类型决定了通信语义：</p>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>类型</th><th>可靠性</th><th>连接性</th><th>典型用途</th></tr>
+</thead>
+<tbody>
+<tr><td><strong>RC</strong>（Reliable Connection）</td><td>可靠，有 ACK/重传</td><td>一对一</td><td>绝大多数生产应用</td></tr>
+<tr><td><strong>UC</strong>（Unreliable Connection）</td><td>不可靠，无重传</td><td>一对一</td><td>实时音视频</td></tr>
+<tr><td><strong>UD</strong>（Unreliable Datagram）</td><td>不可靠，无重传</td><td>多对多</td><td>控制消息、组播</td></tr>
+<tr><td><strong>SRD</strong>（Scalable Reliable Datagram）</td><td>可靠无序</td><td>多对多</td><td>AWS EFA 独有</td></tr>
+</tbody>
+</table>
+</div>
+
+<p>本课程主要关注 <strong>RC</strong> 类型，因为它提供了类似 TCP 的可靠有序传输语义。</p>
+
+<h2>Work Request（WR）与 SGE</h2>
+
+<p>WR（Work Request）是用户提交给 QP 的操作描述符。它描述了要做什么、数据在哪、以及完成后如何通知用户。</p>
+
+<p>SGE（Scatter-Gather Element）描述了一个数据缓冲区：</p>
+
+<pre>struct ibv_sge {
+    uint64_t addr;     // 缓冲区虚拟地址（必须来自已注册的 MR）
+    uint32_t length;   // 数据长度
+    uint32_t lkey;     // 该缓冲区对应 MR 的 lkey
+};</pre>
+
+<p>一个 WR 可以包含多个 SGE，实现 Scatter（接收时分散到多个缓冲区）或 Gather（发送时从多个缓冲区收集数据）。</p>
+
+<h2>Work Completion（WC）的结构</h2>
+
+<p>WC 是操作完成后的证据。每次 poll_cq 返回一个 WC 条目：</p>
+
+<pre>struct ibv_wc {
+    uint64_t wr_id;     // 用户提供的标识符，用于匹配 WR
+    enum ibv_wc_status status;  // IBV_WC_SUCCESS 或错误码
+    enum ibv_wc_opcode opcode;  // 完成的操作类型
+    uint32_t qp_num;    // 产生此完成的 QP 编号
+    uint32_t byte_len;  // 传输的字节数（仅 RECV）
+    uint32_t imm_data;  // 立即数（WRITE_WITH_IMM / SEND_WITH_IMM）
+};</code></pre>
+
+<p><code>wr_id</code> 是连接 WR 和 WC 的纽带。你在提交 WR 时设置 <code>wr.wr_id = my_tag</code>；当 WC 返回时，通过 <code>wc[i].wr_id</code> 就能知道是哪个操作完成了。这是实现事件驱动状态机的关键。</p>
+
+<h2>创建与销毁顺序</h2>
+
+<p>RDMA 对象的创建和销毁有严格的依赖顺序：</p>
+
+<div class="diagram">创建顺序 (CREATE):
+  [Context] ──→ [PD] ──→ [CQ] ──→ [MR] ──→ [QP]
+     1           2           3         4         5
+
+销毁顺序 (DESTROY):
+  [QP] ──→ [MR] ──→ [CQ] ──→ [PD] ──→ [Context]
+   5         4          3         2          1</div>
+
+<p>规则很简单：<strong>先创建的先销毁</strong>。因为 QP 引用了 CQ（完成事件投递到这里），MR 引用了 PD（访问权限检查），所以销毁时必须反向进行。</p>
+
+<div class="callout note">
+<strong>理解依赖</strong>
+写一个简单的 RDMA 程序时，最常见的 crash 原因就是资源释放顺序错误。例如，先销毁了 PD 但还有 MR 属于它，内核在尝试注销 MR 时访问已释放的 PD 会导致 use-after-free。始终遵循后进先出的销毁顺序。
+</div>
+
+<div class="callout">
+<strong>学习路线图</strong>
+至此你已经了解了 RDMA 编程模型的全部核心对象。下一课我们将把这些对象串起来，追踪一个字节从发送缓冲区到接收缓冲区的完整旅程——看看这些对象在数据路径中是如何协同工作的。
+</div>
+
+<footer class="footer">
+  <nav><a href="0002-device-and-env.html">← 上一课</a><a href="index.html">课时列表</a><a href="0004-data-path.html">下一课 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>

@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Verbs 对象生命周期 — RDMA 参考讲义</title>
+<link rel="stylesheet" href="../assets/course.css">
+</head>
+<body>
+
+<aside class="sidebar">
+  <h2><a href="index.html">RDMA 参考讲义</a></h2>
+  <nav>
+    <div class="section-label">实验指导</div>
+    <ul>
+      <li><a href="lab-guide.html">实验指导说明</a></li>
+    </ul>
+    <div class="section-label">核心概念</div>
+    <ul>
+      <li><a href="00-glossary.html">00 · 术语表</a></li>
+      <li><a href="01-rdma-data-path.html">01 · 数据路径</a></li>
+      <li><a href="02-verbs-object-lifecycle.html" class="active">02 · Verbs 生命周期</a></li>
+      <li><a href="03-qp-state-and-completion.html">03 · QP 状态与完成</a></li>
+    </ul>
+    <div class="section-label">进阶主题</div>
+    <ul>
+      <li><a href="04-memory-registration-and-rkey.html">04 · 内存注册与 rkey</a></li>
+      <li><a href="05-rdma-cm-state-machine.html">05 · CM 状态机</a></li>
+      <li><a href="06-performance-methodology.html">06 · 性能方法论</a></li>
+    </ul>
+    <div class="section-label">工程视野</div>
+    <ul>
+      <li><a href="07-production-ecosystem.html">07 · 生产生态</a></li>
+      <li><a href="08-troubleshooting.html">08 · 故障诊断</a></li>
+    </ul>
+    <div class="section-label">课件</div>
+    <ul>
+      <li><a href="../lessons/index.html">课程课件</a></li>
+    </ul>
+  </nav>
+</aside>
+
+<main class="main">
+
+<h1>Verbs 对象生命周期</h1>
+<p class="subtitle">Context、PD、MR、CQ、QP 的创建依赖与销毁顺序</p>
+
+<h2>对象依赖图</h2>
+
+<p>RDMA verbs 对象之间存在严格的依赖层次。下层对象必须在上层对象销毁之后才能释放。违反这一规则会导致内核错误（<code>EBUSY</code>）、use-after-free、或驱动崩溃。</p>
+
+<div class="diagram">        +----------+
+        |  Device   |  物理 RDMA 设备 (HCA / RXE)
+        +----+-----+
+             |
+             v
+        +----------+
+        | Context  |  ibv_context, 通过 ibv_open_device 获得
+        +----+-----+
+             |
+      +------+------+
+      |      |      |
+      v      v      v
+  +-------+ +-------+ +-------+
+  |  PD   | |  CQ   | |  SRQ  |
+  +---+---+ +-------+ +-------+
+      |        |
+  +---+---+   |
+  |       |   |
+  v       v   v
+ +-----+ +-----+
+ | MR  | | QP  |
+ +-----+ +-----+
+
+依赖方向:  创建时 上层 -> 下层
+           销毁时 下层 -> 上层 (逆序)
+
+典型创建顺序:
+  1. ibv_get_device_list / ibv_open_device  →  Context
+  2. ibv_alloc_pd(context)                  →  PD
+  3. ibv_create_cq(context)                 →  CQ
+  4. ibv_reg_mr(pd, ...)                    →  MR
+  5. ibv_create_qp(pd, &qp_init_attr)       →  QP (需要 PD + CQ)
+
+典型销毁顺序:
+  1. ibv_destroy_qp(qp)
+  2. ibv_dereg_mr(mr)
+  3. ibv_destroy_cq(cq)
+  4. ibv_dealloc_pd(pd)
+  5. ibv_close_device(context)</div>
+
+<h2>Context (ibv_context)</h2>
+
+<p>Context 是应用与特定 RDMA 设备之间通信的句柄。它代表一个 <code>/dev/infiniband/uverbsX</code> 文件描述符的打开实例。</p>
+
+<h3>创建</h3>
+<pre><code>struct ibv_device **dev_list;
+struct ibv_context *ctx;
+
+dev_list = ibv_get_device_list(&num_devices);   // 枚举所有 RDMA 设备
+if (!dev_list || num_devices == 0) { /* 无设备 */ }
+
+ctx = ibv_open_device(dev_list[0]);              // 打开第一个设备
+if (!ctx) { /* 打开失败 */ }
+
+ibv_free_device_list(dev_list);                  // 释放设备列表，但 ctx 仍有效</code></pre>
+
+<h3>属性</h3>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>字段</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>device</code></td><td>指向 <code>ibv_device</code> 的指针，描述物理设备信息</td></tr>
+<tr><td><code>cmd_fd</code></td><td>uverbs 字符设备的文件描述符</td></tr>
+<tr><td><code>ops</code></td><td>provider 实现的操作函数表（ABI 封装）</td></tr>
+<tr><td><code>abi_compat</code></td><td>内核与用户态 AB 版本 compat 信息</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>销毁</h3>
+<p>调用 <code>ibv_close_device(ctx)</code>。这是最后一步关闭的句柄。所有从该 context 派生出的对象必须先被销毁。</p>
+
+<div class="callout warn">
+<strong>常见问题</strong>
+多个 context 可以指向同一设备（多进程场景），但每个 context 有独立的对象空间。一个进程内不应同时对同一设备打开大量 context，这会导致内核文件描述符耗尽。
+</div>
+
+<h2>Protection Domain (ibv_pd)</h2>
+
+<p>PD 是 RDMA 的安全隔离域。MR、QP、AH 都必须绑定到一个 PD。同一 PD 内的对象可以互相访问；跨 PD 访问需要 rkey 授权。</p>
+
+<pre><code>struct ibv_pd *pd = ibv_alloc_pd(ctx);
+if (!pd) { /* 分配失败 */ }
+
+// ... 使用 pd 创建 MR、QP ...
+
+ibv_dealloc_pd(pd);   // 销毁，调用前确保所有 MR 已 deregister，所有 QP 已 destroy</code></pre>
+
+<h3>PD 的语义作用</h3>
+<ul>
+<li><strong>安全隔离</strong> — QP 只能访问同一 PD 下的 MR。进程 A 的 QP 无法直接访问进程 B 的 MR（除非跨 PD 传递 rkey）。</li>
+<li><strong>资源分组</strong> — 多租户场景中，不同租户使用不同 PD，防止相互干扰。</li>
+<li><strong>性能</strong> — PD 切换对 HCA 是昂贵的操作（TLB 刷新）。应尽量复用 PD 而非频繁创建销毁。</li>
+</ul>
+
+<h2>Memory Region (ibv_mr)</h2>
+
+<p>MR 将一段用户态虚拟内存注册到 HCA，使其可被 RDMA 操作访问。</p>
+
+<pre><code>struct ibv_mr *mr = ibv_reg_mr(pd, buf, size,
+                                IBV_ACCESS_LOCAL_WRITE |
+                                IBV_ACCESS_REMOTE_WRITE |
+                                IBV_ACCESS_REMOTE_READ);
+if (!mr) { /* 注册失败 */ }
+
+// mr->lkey  — 本地操作 (post_send 的 sge.lkey)
+// mr->rkey  — 远程操作 (RDMA WRITE/READ 时对端使用)
+
+ibv_dereg_mr(mr);     // 注销 MR，释放 pinning 的内存页</code></pre>
+
+<h3>MR 属性</h3>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>字段</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>addr</code></td><td>MR 起始虚拟地址（原传的 buf 地址）</td></tr>
+<tr><td><code>length</code></td><td>MR 大小 (bytes)</td></tr>
+<tr><td><code>lkey</code></td><td>Local Key，本地操作时使用</td></tr>
+<tr><td><code>rkey</code></td><td>Remote Key，远程 RDMA WRITE/READ 时使用</td></tr>
+<tr><td><code>pd</code></td><td>所属 Protection Domain</td></tr>
+</tbody>
+</table>
+</div>
+
+<h3>生命周期注意事项</h3>
+<ul>
+<li><code>ibv_dereg_mr()</code> 会 unpin 之前 pinning 的内存页。如果之后还有 QP 使用这些页做 DMA，会导致数据损坏。</li>
+<li>注销 MR 之前必须确保没有正在执行的 WR 引用该 MR。</li>
+<li>MR 的权限（<code>IBV_ACCESS_REMOTE_WRITE</code> 等）在注册时决定，后续无法修改。需要新权限需 deregister 后重新注册。</li>
+</ul>
+
+<h2>Completion Queue (ibv_cq)</h2>
+
+<p>CQ 存放 Work Completion (WC)。Send 和 Recv 完成的通知都发到同一个 CQ（或不同 CQ，取决于创建时的配置）。</p>
+
+<pre><code>struct ibv_cq *cq = ibv_create_cq(ctx, cqe, NULL, NULL, 0);
+// cqe: CQ 容量（可容纳的 WC 数量）
+// 参数 3: cq_context (ibv_get_cq_event 时返回)
+// 参数 4: channel (Completion Event Channel)
+// 参数 5: comp_vector (MSI-X 中断向量索引)
+
+if (!cq) { /* 创建失败 */ }
+
+// ... 将 cq 关联到 QP 的 send_cq 和/或 recv_cq ...
+
+ibv_destroy_cq(cq);   // 销毁，所有关联 QP 必须先 destroy</code></pre>
+
+<h3>CQ 参数选择</h3>
+
+<table>
+<thead>
+<tr><th>参数</th><th>建议</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td>cqe 数量</td><td>QP 总数 × Queue Depth × 2</td><td>WC 溢出会导致严重的性能下降。CQ 满时新完成的 WQE 无法写入，可能触发异步错误。</td></tr>
+<tr><td>comp_vector</td><td>= qp_index % num_comp_vectors</td><td>中断亲和性，将 CQ 绑定到不同 CPU 可分摊中断处理</td></tr>
+<tr><td>channel</td><td>NULL 使用轮询模式</td><td>如果只需要 ibv_poll_cq 轮询，传 NULL。需要事件通知时需要创建 <code>ibv_comp_channel</code></td></tr>
+</tbody>
+</table>
+
+<h2>Queue Pair (ibv_qp)</h2>
+
+<p>QP 是 RDMA 通信的核心对象。每个 QP 包含两个子队列：Send Queue 和 Receive Queue。</p>
+
+<pre><code>struct ibv_qp_init_attr attr = {
+    .qp_context = NULL,
+    .send_cq = cq,
+    .recv_cq = cq,         // send 和 recv 可用同一个 CQ
+    .srq = NULL,           // 使用独立 RQ（非 SRQ）
+    .cap = {
+        .max_send_wr  = 128,
+        .max_recv_wr  = 128,
+        .max_send_sge = 1,
+        .max_recv_sge = 1,
+        .max_inline_data = 0,
+    },
+    .qp_type = IBV_QPT_RC,
+};
+
+struct ibv_qp *qp = ibv_create_qp(pd, &attr);
+if (!qp) { /* 创建失败 */ }
+
+// ... 修改 QP 状态: RESET -> INIT -> RTR -> RTS ...
+
+ibv_destroy_qp(qp);   // 销毁。必须先于 CQ 和 PD 的销毁</code></pre>
+
+<h3>QP 属性</h3>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>字段</th><th>说明</th></tr>
+</thead>
+<tbody>
+<tr><td><code>qp_num</code></td><td>QP 编号，对端在 INIT→RTR transition 时需要知道</td></tr>
+<tr><td><code>pd</code></td><td>所属 PD</td></tr>
+<tr><td><code>send_cq / recv_cq</code></td><td>发送/接收完成的 CQ，可以相同</td></tr>
+<tr><td><code>qp_type</code></td><td>RC / UC / UD / XRC / RAW_PACKET</td></tr>
+<tr><td><code>state</code></td><td>当前 QP 状态</td></tr>
+<tr><td><code>sq / rq</code></td><td>发送/接收队列深度和 sge 限制</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>销毁顺序规则</h2>
+
+<p>RDMA 对象销毁必须 <strong>严格按照依赖关系的逆序</strong> 执行。原因在于每个对象都持有对上层对象的引用。如果先销毁父对象，子对象可能仍在硬件中存有 DMA 操作引用。</p>
+
+<pre><code>// ==== 推荐销毁顺序 ====
+
+// 第 1 步: 销毁所有 QP
+rc = ibv_destroy_qp(qp);
+if (rc) { /* 失败: QP 可能仍有未完成的 WR */ }
+
+// 第 2 步: 注销所有 MR
+rc = ibv_dereg_mr(mr);
+if (rc) { /* 失败: MR 可能仍被 QP 引用 */ }
+
+// 第 3 步: 销毁 CQ
+rc = ibv_destroy_cq(cq);
+if (rc) { /* 失败: CQ 不为空或仍有 QP 关联 */ }
+
+// 第 4 步: 释放 PD
+rc = ibv_dealloc_pd(pd);
+if (rc) { /* 失败: PD 下仍有 MR 或 QP */ }
+
+// 第 5 步: 关闭设备
+rc = ibv_close_device(ctx);
+if (rc) { /* 失败: 关闭问题 */ }</code></pre>
+
+<div class="callout note">
+<strong>为什么必须逆序？</strong>
+每层对象销毁时都会检查子对象列表。例如 <code>ibv_destroy_qp()</code> 会在内核中将 QP 标记为正在销毁，确保 HCA 不会再处理该 QP 的 DMA 操作。<code>ibv_dereg_mr()</code> 会 unpin 内存页。如果先 dereg MR 而 QP 仍在工作，HCA 的 DMA 操作可能访问已经 unpin 的页面，导致数据损坏或 IOMMU 错误。
+</div>
+
+<h2>常见错误与诊断</h2>
+
+<div class="table-wrap">
+<table>
+<thead>
+<tr><th>错误</th><th>症状</th><th>根因</th></tr>
+</thead>
+<tbody>
+<tr><td><code>EINVAL</code> on destroy_qp</td><td><code>ibv_destroy_qp()</code> 返回 -1, errno = EINVAL</td><td>QP 处于错误状态且有未完成的 WR。需先将 QP 移到 RESET 再 destroy。</td></tr>
+<tr><td><code>EBUSY</code> on dealloc_pd</td><td><code>ibv_dealloc_pd()</code> 返回 <code>EBUSY</code></td><td>PD 下仍有未销毁的 MR 或 QP。检查销毁顺序。</td></tr>
+<tr><td><code>ENOMEM</code> on reg_mr</td><td>MR 注册失败，内存不足</td><td>进程 locked memory 限制 (ulimit -l) 太低。MR 注册需要 pinning 内存页。</td></tr>
+<tr><td>Segfault after dereg_mr</td><td>应用 segfault 或数据损坏</td><td>QP 仍然引用已注销的 MR。确保所有依赖该 MR 的 WR 已完成再 dereg。</td></tr>
+<tr><td>CQ 溢出 (<code>WC_WR_FLUSH_ERR</code>)</td><td>WC 状态为 <code>IBV_WC_WR_FLUSH_ERR</code></td><td>CQ 深度不足。当 CQ 满时新完成的 WQE 被丢弃，相关 WR 返回 flush 状态。</td></tr>
+<tr><td>QP 创建失败</td><td><code>ibv_create_qp()</code> 返回 NULL</td><td>可能是 PD 不匹配或 CAP 参数超出设备限制。检查 <code>ibv_query_device()</code> 的设备能力。</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="callout warn">
+<strong>调试建议</strong>
+使用 <code>ibv_devinfo</code> 命令查看设备能力、端口状态、GID 表。使用 <code>cat /sys/class/infiniband/*/device/num_comp_vectors</code> 查看中断向量数。异常时检查 <code>dmesg</code> 中的 RDMA 子系统报错。
+</div>
+
+<footer class="footer">
+  <nav><a href="01-rdma-data-path.html">← 上一页</a><a href="03-qp-state-and-completion.html">下一页 →</a></nav>
+</footer>
+
+</main>
+</body>
+</html>
