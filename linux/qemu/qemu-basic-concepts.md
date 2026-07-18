@@ -2092,4 +2092,109 @@ Guest 输出  ──► 写数据寄存器 ──► chr_fe_write ──► Host
 - [ ] meson + Kconfig + 机型 select
 - [ ] 该迁的状态进了 vmstate（时钟默认不自动迁）
 
-### 一句话
+
+# PCIe建模
+
+```c
+static void pci_update_irq_disabled(PCIDevice *d, int was_irq_disabled)
+{
+    int i, disabled = pci_irq_disabled(d);
+    if (disabled == was_irq_disabled)
+        return;
+    for (i = 0; i < PCI_NUM_PINS; ++i) {
+        int state = pci_irq_state(d, i);
+        pci_change_irq_level(d, i, disabled ? -state : state);
+    }
+}
+
+pci_update_irq_disabled(d, old_state_of_irq_disabled);
+
+```
+
+那pci去修改irq使能与否就是看qemu在什么数据里设置 pci irq data fields:
+
+```c
+static void pci_change_irq_level(PCIDevice *pci_dev, int irq_num, int change)
+{
+    PCIBus *bus;
+    for (;;) {
+        int dev_irq = irq_num;
+        bus = pci_get_bus(pci_dev); // bus 信息的可见性在qemu中是
+        assert(bus->map_irq);
+        irq_num = bus->map_irq(pci_dev, irq_num);
+        trace_pci_route_irq(dev_irq, DEVICE(pci_dev)->canonical_path, irq_num,
+                            pci_bus_is_root(bus) ? "root-complex"
+                                    : DEVICE(bus->parent_dev)->canonical_path);
+        if (bus->set_irq)
+            break;
+        pci_dev = bus->parent_dev;
+    }
+    pci_bus_change_irq_level(bus, irq_num, change); // 实际通过 change irq level来设置
+}
+
+static void pci_bus_change_irq_level(PCIBus *bus, int irq_num, int change)
+{
+    assert(irq_num >= 0);
+    assert(irq_num < bus->nirq);
+    bus->irq_count[irq_num] += change;
+    bus->set_irq(bus->irq_opaque, irq_num, bus->irq_count[irq_num] != 0);
+}
+
+void pci_bus_irqs(PCIBus *bus, pci_set_irq_fn set_irq,
+                  void *irq_opaque, int nirq)
+{
+    bus->set_irq = set_irq;
+    bus->irq_opaque = irq_opaque;
+    bus->nirq = nirq;
+    g_free(bus->irq_count);
+    bus->irq_count = g_malloc0(nirq * sizeof(bus->irq_count[0]));
+}
+
+PCIBus *pci_register_root_bus(DeviceState *parent, const char *name,
+                              pci_set_irq_fn set_irq,  // <<<***>>>
+                              pci_map_irq_fn map_irq,
+                              void *irq_opaque,
+                              MemoryRegion *mem, MemoryRegion *io,
+                              uint8_t devfn_min, int nirq,
+                              const char *typename)
+{
+    PCIBus *bus;
+
+    bus = pci_root_bus_new(parent, name, mem, io, devfn_min, typename);
+    pci_bus_irqs(bus, set_irq, irq_opaque, nirq); // <<<***>>>
+    pci_bus_map_irqs(bus, map_irq);
+    return bus;
+}
+
+```
+
+可以看到各种 pcie 设备建模中，会实现自己的 `set_irq` 函数，通过 `pci_register_root_bus` 注册成为钩子；
+比如 designware:
+
+```c
+pci->bus = pci_register_root_bus(dev, "pcie",
+                                 designware_pcie_set_irq, // set_irq
+                                 pci_swizzle_map_irq_fn, 
+                                 s,
+                                 &s->pci.memory,
+                                 &s->pci.io,
+                                 0, 4,
+                                 TYPE_DESIGNWARE_PCIE_ROOT_BUS);
+static void designware_pcie_set_irq(void *opaque, int irq_num, int level)
+{
+    DesignwarePCIEHost *host = DESIGNWARE_PCIE_HOST(opaque);
+
+    qemu_set_irq(host->pci.irqs[irq_num], level);
+}
+
+#define TYPE_DESIGNWARE_PCIE_HOST "designware-pcie-host"
+OBJECT_DECLARE_SIMPLE_TYPE(DesignwarePCIEHost, DESIGNWARE_PCIE_HOST)
+
+void qemu_set_irq(qemu_irq irq, int level)
+{
+    if (!irq)
+        return;
+
+    irq->handler(irq->opaque, irq->n, level);
+}
+```
