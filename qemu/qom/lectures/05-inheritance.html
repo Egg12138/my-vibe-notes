@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>#05 继承、接口与类型转换 — QEMU QOM 教学</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="top-nav">
+  <a href="index.html">Portal</a>
+  <span class="sep">|</span>
+  <a href="01-motivation.html">#01</a> <span class="sep">|</span>
+  <a href="02-type-registry.html">#02</a> <span class="sep">|</span>
+  <a href="03-lifecycle.html">#03</a> <span class="sep">|</span>
+  <a href="04-properties.html">#04</a> <span class="sep">|</span>
+  <span class="current">#05 Inheritance</span>
+  <span class="sep">|</span>
+  <a href="06-type-landscape.html">#06</a> <span class="sep">|</span>
+  <a href="07-capstone.html">#07</a>
+</div>
+
+<h1>#05 继承、接口与类型转换</h1>
+
+<h2>5.1 Type Hierarchy —— 继承链</h2>
+
+<p>QOM 的继承通过 TypeInfo 的 <code>.parent</code> 字段声明。看看 QEMU 的核心继承链：</p>
+
+<div class="ascii-box type-hierarchy">
+  TYPE_OBJECT ("object")              ← 根类型, abstract
+  │
+  ├─ TYPE_DEVICE ("device")           ← 所有设备的基类, abstract
+  │    │
+  │    ├─ TYPE_SYS_BUS_DEVICE         ← 挂 system bus 的设备, abstract
+  │    │    ├─ "edu"                  ← 一个具体设备
+  │    │    ├─ "serial"               ← 16550 UART
+  │    │    └─ ...
+  │    │
+  │    ├─ TYPE_PCI_DEVICE             ← PCI 设备基类, abstract
+  │    │    ├─ "e1000"                ← Intel e1000 网卡
+  │    │    ├─ "virtio-net-pci"       ← virtio-net PCI 适配器
+  │    │    └─ ...
+  │    │
+  │    └─ (更多设备子类型...)
+  │
+  ├─ TYPE_BUS ("bus")                 ← 总线基类
+  │    ├─ TYPE_PCI_BUS ("PCI")        ← PCI 总线
+  │    ├─ TYPE_SYSTEM_BUS             ← 系统总线
+  │    └─ TYPE_I2C_BUS                ← I2C 总线
+  │
+  ├─ TYPE_MACHINE ("machine")         ← Machine 类型
+  │    ├─ "virt-machine"              ← ARM virt
+  │    ├─ "pc-q35-*"                  ← x86 Q35
+  │    └─ ...
+  │
+  ├─ TYPE_MEMORY_BACKEND ("memory-backend")
+  │    ├─ "memory-backend-ram"
+  │    ├─ "memory-backend-file"
+  │    └─ "memory-backend-memfd"
+  │
+  └─ TYPE_CONTAINER ("container")
+</div>
+
+<h2>5.2 继承如何在 Class 层面实现</h2>
+
+<p>
+Class 的继承通过 <strong>memcpy + 覆盖</strong> 实现（参见 #03 的 type_initialize 流程）。
+核心技术约束：
+</p>
+
+<ol>
+  <li><strong>Instance 首字段必须是 parent instance struct</strong> —— 保证向上转型安全</li>
+  <li><strong>Class 首字段必须是 parent class struct</strong> —— 保证父类函数指针被正确继承</li>
+  <li><strong>子类 class_size ≥ 父类 class_size</strong> —— memcpy 的基础</li>
+</ol>
+
+<pre><code><span class="cm">/* DeviceState 的首字段是 Object (通过包含 parent_obj) */</span>
+<span class="kw">struct</span> <span class="ty">DeviceState</span> {
+    Object parent_obj;   <span class="cm">/* ★ 必须是第一个字段！ */</span>
+    <span class="kw">const char</span> *id;
+    <span class="kw">bool</span> realized;
+    ...
+};
+
+<span class="cm">/* DeviceClass 的首字段是 ObjectClass */</span>
+<span class="kw">struct</span> <span class="ty">DeviceClass</span> {
+    ObjectClass parent_class;   <span class="cm">/* ★ 必须是第一个字段！ */</span>
+    DeviceRealize realize;
+    DeviceUnrealize unrealize;
+    ...
+};</code></pre>
+
+<div class="note">
+  <strong>为什么这种结构保证安全？</strong>
+  <code>&amp;dev->parent_obj == (Object *)dev</code> 因为 parent_obj 在偏移 0 处。
+  同样 <code>&amp;dc->parent_class == (ObjectClass *)dc</code>。
+  这就是 C 语言中实现 <code>static_cast&lt;Base*&gt;</code> 的根本条件。
+</div>
+
+<h2>5.3 OBJECT_DECLARE_TYPE 宏 —— 类型安全转换</h2>
+
+<p>手动写 <code>(DeviceState *)obj</code> 是不安全的。QOM 提供了一套 C 宏生成类型安全的转换函数：</p>
+
+<pre><code><span class="cm">/* include/qom/object.h:234 */</span>
+<span class="ma">#define OBJECT_DECLARE_TYPE(InstanceType, ClassType, MODULE_OBJ_NAME)</span>
+<span class="ma">    typedef struct InstanceType InstanceType;</span>
+<span class="ma">    typedef struct ClassType ClassType;</span>
+<span class="ma">    G_DEFINE_AUTOPTR_CLEANUP_FUNC(InstanceType, object_unref)</span>
+<span class="ma">    DECLARE_OBJ_CHECKERS(InstanceType, ClassType, MODULE_OBJ_NAME, \</span>
+<span class="ma">                         TYPE_##MODULE_OBJ_NAME)</span></code></pre>
+
+<p>以 <code>OBJECT_DECLARE_TYPE(DeviceState, DeviceClass, DEVICE)</code> 为例，展开后生成：</p>
+
+<pre><code><span class="cm">/* 已展开: OBJECT_DECLARE_TYPE(DeviceState, DeviceClass, DEVICE) */</span>
+
+<span class="cm">/* 1. typedefs */</span>
+<span class="kw">typedef struct</span> DeviceState DeviceState;
+<span class="kw">typedef struct</span> DeviceClass DeviceClass;
+
+<span class="cm">/* 2. g_autoptr 支持 —— 离开作用域自动 object_unref */</span>
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(DeviceState, object_unref)
+
+<span class="cm">/* 3. 类型安全转换函数 */</span>
+
+<span class="cm">/* Instance checker: Object* → DeviceState* */</span>
+<span class="kw">static inline</span> DeviceState *DEVICE(<span class="kw">const void</span> *obj) {
+    <span class="kw">return</span> OBJECT_CHECK(DeviceState, obj, TYPE_DEVICE);
+}
+
+<span class="cm">/* Class getter: Object* → DeviceClass* */</span>
+<span class="kw">static inline</span> DeviceClass *DEVICE_GET_CLASS(<span class="kw">const void</span> *obj) {
+    <span class="kw">return</span> OBJECT_GET_CLASS(DeviceClass, obj, TYPE_DEVICE);
+}
+
+<span class="cm">/* Class checker: ObjectClass* → DeviceClass* */</span>
+<span class="kw">static inline</span> DeviceClass *DEVICE_CLASS(<span class="kw">const void</span> *klass) {
+    <span class="kw">return</span> OBJECT_CLASS_CHECK(DeviceClass, klass, TYPE_DEVICE);
+}</code></pre>
+
+<p>使用时：</p>
+
+<pre><code><span class="kw">void</span> some_func(Object *obj)
+{
+    DeviceState *dev = DEVICE(obj);       <span class="cm">/* 运行时检查: obj 确实是 TYPE_DEVICE 的子类型? */</span>
+    DeviceClass *dc = DEVICE_GET_CLASS(obj); <span class="cm">/* 通过 obj->class 获取 DeviceClass */</span>
+}</code></pre>
+
+<h2>5.4 OBJECT_CHECK —— 运行时类型检查</h2>
+
+<pre><code><span class="cm">/* include/qom/object.h:531 */</span>
+<span class="ma">#define OBJECT_CHECK(type, obj, name)</span>
+<span class="ma">    ((type *)object_dynamic_cast_assert(OBJECT(obj), (name), \</span>
+<span class="ma">                                        __FILE__, __LINE__, __func__))</span></code></pre>
+
+<p><code>object_dynamic_cast</code> 是运行时类型检查的核心：</p>
+
+<pre><code><span class="kw">static</span> Object *object_dynamic_cast_assert(Object *obj, <span class="kw">const char</span> *typename,
+                                          <span class="kw">const char</span> *file, <span class="kw">int</span> line,
+                                          <span class="kw">const char</span> *func)
+{
+    Object *inst;
+    <span class="kw">for</span> (<span class="kw">int</span> i = 0; obj &amp;&amp; i < OBJECT_CLASS_CAST_CACHE; i++) {
+        <span class="kw">if</span> (obj->class->object_cast_cache[i] == typename) {
+            <span class="kw">goto</span> out;  <span class="cm">/* cache hit —— 绝大多数情况 */</span>
+        }
+    }
+
+    <span class="cm">/* cache miss: 遍历 type hierarchy */</span>
+    inst = object_dynamic_cast(obj, typename);
+
+    <span class="kw">if</span> (!inst &amp;&amp; obj) {
+        fprintf(stderr, <span class="str">"...assertion failed...\n"</span>);
+        abort();
+    }
+
+    <span class="kw">if</span> (!obj) {
+        <span class="kw">return</span> inst;
+    }
+
+    <span class="cm">/* 更新 cache */</span>
+    obj->class->object_cast_cache[i] = typename;
+    return obj;
+
+out:
+    return obj;
+}</code></pre>
+
+<p><code>object_dynamic_cast</code> 的实质：</p>
+
+<pre><code>Object *object_dynamic_cast(Object *obj, <span class="kw">const char</span> *typename)
+{
+    TypeImpl *target_type = type_get_by_name_noload(typename);
+    TypeImpl *obj_type = obj->class->type;
+
+    <span class="kw">if</span> (type_is_ancestor(obj_type, target_type)) {
+        <span class="kw">return</span> obj;
+    }
+
+    <span class="cm">/* interface check: 遍历 obj_type 的所有接口，看是否匹配 target_type */</span>
+    <span class="kw">for</span> (<span class="kw">int</span> i = 0; i < obj_type->num_interfaces; i++) {
+        ...
+    }
+
+    <span class="kw">return</span> NULL;
+}</code></pre>
+
+<h2>5.5 4 个 Cast 缓存槽</h2>
+
+<p>
+<code>OBJECT_CLASS_CAST_CACHE</code> = 4 意味着每个 Class 缓存最近 4 种成功的 cast。
+这很重要：在热路径上（如每个 I/O 操作），避免每次都遍历 type hierarchy。
+</p>
+
+<pre><code><span class="kw">struct</span> <span class="ty">ObjectClass</span> {
+    ...
+    <span class="kw">const char</span> *object_cast_cache[4];  <span class="cm">/* OBJECT_CHECK 缓存 */</span>
+    <span class="kw">const char</span> *class_cast_cache[4];   <span class="cm">/* OBJECT_CLASS_CHECK 缓存 */</span>
+};</code></pre>
+
+<h2>5.6 接口 (Interface)</h2>
+
+<p>QOM 支持类似 Java <code>implements</code> 的概念——接口：</p>
+
+<pre><code><span class="cm">/* 声明一个接口类型（通常是 abstract 的） */</span>
+<span class="ma">#define TYPE_USER_CREATABLE "user-creatable"</span>
+
+<span class="kw">typedef struct</span> InterfaceClass UserCreatableClass {
+    InterfaceClass parent_class;
+    <span class="kw">void</span> (*complete)(UserCreatable *uc, Error **errp);
+    <span class="kw">bool</span> (*can_be_deleted)(UserCreatable *uc);
+} UserCreatableClass;
+
+<span class="cm">/* 在 OBJECT_DEFINE_TYPE_WITH_INTERFACES 中声明接口: */</span>
+OBJECT_DEFINE_TYPE_WITH_INTERFACES(MyDevice, my_device,
+    MY_DEVICE, DEVICE,
+    { TYPE_USER_CREATABLE },      <span class="cm">/* interface 1 */</span>
+    { TYPE_RESETTABLE_INTERFACE }, <span class="cm">/* interface 2 */</span>
+    { }                            <span class="cm">/* sentinel */</span>
+);</code></pre>
+
+<p>类型检查时，接口也被纳入 <code>type_is_ancestor</code> 的检查范围：</p>
+
+<pre><code><span class="cm">/* 检查 obj 是否实现了 user-creatable 接口 */</span>
+UserCreatable *uc = (<span class="ty">UserCreatable</span> *)object_dynamic_cast(obj, TYPE_USER_CREATABLE);
+<span class="kw">if</span> (uc) {
+    user_creatable_complete(uc, errp);  <span class="cm">/* 安全: 确认实现了该接口 */</span>
+}</code></pre>
+
+<h2>5.7 OBJECT_DEFINE_TYPE 宏展开全景</h2>
+
+<p>
+这是理解 QOM 编程范式的 <strong>最核心的宏</strong>。以 TYPE_OBJECT → TYPE_DEVICE 为例：
+</p>
+
+<pre><code><span class="cm">/* hw/core/qdev.c — 简化示意 */</span>
+
+<span class="cm">/* OBJECT_DEFINE_TYPE(DeviceState, device, DEVICE, OBJECT) 展开为: */</span>
+
+<span class="kw">static void</span> device_finalize(Object *obj);
+<span class="kw">static void</span> device_class_init(ObjectClass *oc, <span class="kw">const void</span> *data);
+<span class="kw">static void</span> device_init(Object *obj);
+
+<span class="kw">static const</span> TypeInfo device_info = {
+    .parent          = TYPE_OBJECT,          <span class="cm">/* ← 继承声明 */</span>
+    .name            = <span class="str">"device"</span>,
+    .instance_size   = <span class="kw">sizeof</span>(DeviceState),
+    .instance_align  = __alignof__(DeviceState),
+    .instance_init   = device_init,
+    .instance_finalize = device_finalize,
+    .class_size      = <span class="kw">sizeof</span>(DeviceClass),
+    .class_init      = device_class_init,
+    .abstract        = <span class="kw">true</span>,               <span class="cm">/* TYPE_DEVICE 是抽象的 */</span>
+};
+
+<span class="kw">static void</span> device_register_types(<span class="kw">void</span>)
+{
+    type_register_static(&amp;device_info);
+}
+type_init(device_register_types);         <span class="cm">/* ★ 构造时注册 */</span>
+
+<span class="cm">/* 然后开发者实现三个函数: */</span>
+<span class="kw">static void</span> device_init(Object *obj)       { <span class="cm">/* 实例初始化 */</span> }
+<span class="kw">static void</span> device_class_init(ObjectClass *oc, <span class="kw">const void</span> *data) {
+    <span class="cm">/* 设置虚函数指针, 注册属性 */</span>
+}
+<span class="kw">static void</span> device_finalize(Object *obj)   { <span class="cm">/* 清理 */</span> }</code></pre>
+
+<div class="note">
+  <strong>完整 QOM 编程范式的三个步骤：</strong>
+  <ol>
+    <li><strong>Header</strong>: 定义 Instance struct (首字段: ParentInstance)、Class struct (首字段: ParentClass)，调用 <code>OBJECT_DECLARE_TYPE</code></li>
+    <li><strong>Source</strong>: 调用 <code>OBJECT_DEFINE_TYPE</code> 宏，实现 _init/_class_init/_finalize</li>
+    <li><strong>Registration</strong>: type_init 宏自动在 QOM 初始化阶段调用 type_register_static</li>
+  </ol>
+</div>
+
+<h2>本模块小结</h2>
+
+<table>
+  <tr><th>机制</th><th>实现</th></tr>
+  <tr><td>继承</td><td>TypeInfo.parent → memcpy(parent_class) → class_init 覆盖</td></tr>
+  <tr><td>类型安全转换</td><td>OBJECT_DECLARE_TYPE 生成 cast 函数 → OBJECT_CHECK → object_dynamic_cast</td></tr>
+  <tr><td>运行时类型检查</td><td>type_is_ancestor(): 沿 parent 链向上查找，含 interface 检查</td></tr>
+  <tr><td>Cast 缓存</td><td>object_cast_cache[4]: 缓存最近 4 次成功 cast 的结果</td></tr>
+  <tr><td>接口</td><td>InterfaceInfo + OBJECT_DEFINE_TYPE_WITH_INTERFACES + object_dynamic_cast 检查</td></tr>
+  <tr><td>完整范式</td><td>OBJECT_DECLARE_TYPE(header) + OBJECT_DEFINE_TYPE(source) + type_init</td></tr>
+</table>
+
+<div class="footer">
+  <p><a href="04-properties.html">← #04 Properties</a> | <a href="index.html">Portal</a> | <a href="06-type-landscape.html">#06 Landscape →</a></p>
+  <p>Source: QEMU <code>master</code> @ <code>ac0cc20ad2</code> — 2026-07-21</p>
+</div>
+
+</body>
+</html>

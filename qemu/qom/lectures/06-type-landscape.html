@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>#06 QEMU 中的 QOM 类型全景图 — QEMU QOM 教学</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="top-nav">
+  <a href="index.html">Portal</a>
+  <span class="sep">|</span>
+  <a href="01-motivation.html">#01</a> <span class="sep">|</span>
+  <a href="02-type-registry.html">#02</a> <span class="sep">|</span>
+  <a href="03-lifecycle.html">#03</a> <span class="sep">|</span>
+  <a href="04-properties.html">#04</a> <span class="sep">|</span>
+  <a href="05-inheritance.html">#05</a> <span class="sep">|</span>
+  <span class="current">#06 Landscape</span>
+  <span class="sep">|</span>
+  <a href="07-capstone.html">#07</a>
+</div>
+
+<h1>#06 QEMU 中的 QOM 类型全景图</h1>
+
+<p>
+QOM 不是只在几个设备中用 —— 它是 QEMU 的 <strong>骨架</strong>。几乎所有你能在 QEMU 中
+"看到"的东西都是 QOM 类型。本讲绘制一张完整的 QOM 类型地图。
+</p>
+
+<h2>6.1 根类型：TYPE_OBJECT</h2>
+
+<pre><code><span class="cm">/* include/qom/object.h:28 */</span>
+<span class="ma">#define TYPE_OBJECT "object"</span>
+
+<span class="cm">/* qom/object.c:2850 —— 根类型注册 */</span>
+<span class="kw">static const</span> TypeInfo object_info = {
+    .name          = TYPE_OBJECT,        <span class="cm">/* "object" */</span>
+    .instance_size = <span class="kw">sizeof</span>(Object),    <span class="cm">/* 48 bytes 左右 */</span>
+    .class_init    = object_class_init,
+    .abstract      = <span class="kw">true</span>,             <span class="cm">/* 根类型总是抽象的 */</span>
+};</code></pre>
+
+<p>
+<code>TYPE_OBJECT</code> 是 QOM 类型树中 <strong>唯一没有 parent 的类型</strong>。
+所有其他类型最终都继承自它。<code>ObjectClass</code> 定义了最基础的虚函数：
+<code>unparent</code>（从 composition tree 移除时的回调）。
+<code>Object</code> 定义了 <code>ref</code>（引用计数）、<code>parent</code>（composition tree 父节点）。
+</p>
+
+<h2>6.2 TYPE_DEVICE —— 设备基类</h2>
+
+<pre><code><span class="cm">/* include/hw/qdev-core.h:77 */</span>
+<span class="ma">#define TYPE_DEVICE "device"</span>
+OBJECT_DECLARE_TYPE(DeviceState, DeviceClass, DEVICE)
+
+<span class="kw">struct</span> <span class="ty">DeviceClass</span> {
+    ObjectClass parent_class;            <span class="cm">/* 继承 ObjectClass */</span>
+
+    <span class="cm">/* 设备虚函数 */</span>
+    DeviceRealize realize;               <span class="cm">/* ★ 最重要的回调 */</span>
+    DeviceUnrealize unrealize;
+    DeviceReset legacy_reset;            <span class="cm">/* deprecated, 用 ResettableInterface */</span>
+    DeviceSyncConfig sync_config;
+
+    <span class="cm">/* 元数据 */</span>
+    DECLARE_BITMAP(categories, DEVICE_CATEGORY_MAX);
+    <span class="kw">const char</span> *fw_name;
+    <span class="kw">const char</span> *desc;
+    <span class="kw">const</span> Property *props_;
+    <span class="kw">bool</span> user_creatable;
+    <span class="kw">bool</span> hotpluggable;
+
+    <span class="cm">/* 总线关联 */</span>
+    <span class="kw">const char</span> *bus_type;               <span class="cm">/* 该设备插在什么总线上 */</span>
+};</code></pre>
+
+<p>
+<strong>QEMU 中的所有硬件设备都是 TYPE_DEVICE 的子类型。</strong>
+这包括 PCI 设备、SysBus 设备、I2C 设备、USB 设备等。TYPE_DEVICE 引入了
+两阶段构造（instance_init + realize）、device category 分类、hotpluggable 标记、
+legacy reset 等核心概念。
+</p>
+
+<h2>6.3 TYPE_BUS —— 总线基类</h2>
+
+<pre><code><span class="cm">/* include/hw/qdev-core.h:318 */</span>
+<span class="ma">#define TYPE_BUS "bus"</span>
+OBJECT_DECLARE_TYPE(BusState, BusClass, BUS)
+
+<span class="kw">struct</span> <span class="ty">BusState</span> {
+    Object parent_obj;
+    DeviceState *parent;              <span class="cm">/* 总线所属的设备 */</span>
+    <span class="kw">const char</span> *name;
+    BusClass *parent_class_override;  <span class="cm">/* 用于 hotplug handler */</span>
+};</code></pre>
+
+<p>Bus 的特殊之处：</p>
+<ul>
+  <li>每个 Bus 实例都有一个 <code>parent</code> DeviceState（总线属于某个设备，如 PCI host bridge）</li>
+  <li>每个 Device 都有一个 <code>parent_bus</code>（设备插入某条总线）</li>
+  <li>设备树就是通过这个 Device ↔ Bus 的双向链接构建的</li>
+</ul>
+
+<h2>6.4 TYPE_SYS_BUS_DEVICE —— 系统总线设备</h2>
+
+<pre><code><span class="cm">/* include/hw/core/sysbus.h:18 */</span>
+<span class="ma">#define TYPE_SYS_BUS_DEVICE "sys-bus-device"</span>
+OBJECT_DECLARE_TYPE(SysBusDevice, SysBusDeviceClass, SYS_BUS_DEVICE)
+
+<span class="kw">struct</span> <span class="ty">SysBusDevice</span> {
+    DeviceState parent_obj;
+    <span class="kw">int</span> num_mmio;
+    <span class="kw">struct</span> {
+        hwaddr addr;
+        MemoryRegion *memory;
+    } mmio[QDEV_MAX_MMIO];
+    <span class="kw">int</span> num_pio;
+    <span class="kw">struct</span> { ... } pio[QDEV_MAX_PIO];
+};</code></pre>
+
+<p>
+SysBusDevice 是 <strong>数量最多的设备类型</strong>—— 它代表直接映射到系统地址空间的设备：
+UART、Timer、GPIO 控制器、中断控制器……这些设备通过 MMIO 或 PIO 与 CPU 交互。
+</p>
+
+<h2>6.5 TYPE_PCI_DEVICE —— PCI 设备</h2>
+
+<pre><code><span class="cm">/* include/hw/pci/pci_device.h:9 */</span>
+<span class="ma">#define TYPE_PCI_DEVICE "pci-device"</span>
+OBJECT_DECLARE_TYPE(PCIDevice, PCIDeviceClass, PCI_DEVICE)
+
+<span class="kw">struct</span> <span class="ty">PCIDevice</span> {
+    DeviceState qdev;                  <span class="cm">/* 继承 DeviceState */</span>
+    <span class="cm">/* PCI 配置空间 */</span>
+    uint8_t config[PCI_CONFIG_SPACE_SIZE];
+    <span class="cm">/* PCI BARs */</span>
+    MemoryRegion io_regions[PCI_NUM_REGIONS];
+    ...
+};</code></pre>
+
+<p>
+PCIDevice 的层次关系：<code>TYPE_OBJECT → TYPE_DEVICE → TYPE_PCI_DEVICE → TYPE_E1000</code>。
+通过这种多层继承，e1000 自动获得了 DeviceState（id, realized, parent_bus）→ 再获得
+PCIDevice（config space, BARs）→ 最后添加自己的 e1000-specific 字段。
+</p>
+
+<h2>6.6 TYPE_MACHINE —— Machine 类型</h2>
+
+<pre><code><span class="cm">/* include/hw/boards.h:23 */</span>
+<span class="ma">#define TYPE_MACHINE "machine"</span>
+OBJECT_DECLARE_TYPE(MachineState, MachineClass, MACHINE)
+
+<span class="kw">struct</span> <span class="ty">MachineClass</span> {
+    ObjectClass parent_class;
+    <span class="kw">const char</span> *family;
+    <span class="kw">const char</span> *desc;
+    <span class="kw">void</span> (*init)(MachineState *ms);           <span class="cm">/* 旧式 init */</span>
+    <span class="kw">void</span> (*setup_fw_cfg)(MachineState *ms);    <span class="cm">/* firmware config */</span>
+    <span class="kw">bool</span> (*get_hotplug_handler)(...);
+    ...
+};</code></pre>
+
+<p>
+Machine 类型用于定义虚拟平台：<code>-M virt</code> 选择 <code>"virt-machine"</code> 类型，
+<code>-M pc-q35-6.2</code> 选择 Q35 芯片组的 x86 PC。Machine 的 <code>init</code> 回调
+负责创建所有板载设备、CPU、内存映射。
+</p>
+
+<h2>6.7 TYPE_MEMORY_BACKEND —— 内存后端</h2>
+
+<pre><code><span class="cm">/* include/sysemu/hostmem.h */</span>
+<span class="ma">#define TYPE_MEMORY_BACKEND "memory-backend"</span>
+<span class="ma">#define TYPE_MEMORY_BACKEND_RAM "memory-backend-ram"</span>
+<span class="ma">#define TYPE_MEMORY_BACKEND_FILE "memory-backend-file"</span>
+<span class="ma">#define TYPE_MEMORY_BACKEND_MEMFD "memory-backend-memfd"</span></code></pre>
+
+<p>MemoryBackend 负责管理 guest RAM 的分配策略：</p>
+<ul>
+  <li><code>memory-backend-ram</code>：匿名 mmap（最常见）</li>
+  <li><code>memory-backend-file</code>：文件 mmap（hugepage、DAX）</li>
+  <li><code>memory-backend-memfd</code>：memfd_create（共享内存）</li>
+</ul>
+
+<p>通过 <code>-object memory-backend-ram,id=mem0,size=1G,share=on</code> 创建。</p>
+
+<h2>6.8 TYPE_USER_CREATABLE —— 用户可创建接口</h2>
+
+<pre><code><span class="cm">/* include/qom/object_interfaces.h:8 */</span>
+<span class="ma">#define TYPE_USER_CREATABLE "user-creatable"</span></code></pre>
+
+<p>
+<code>TYPE_USER_CREATABLE</code> 是一个 <strong>接口类型</strong>，不是一个具体的类。
+任何可以通过 <code>-object</code> 或 <code>object_add</code> 创建的对象都必须实现此接口：
+</p>
+
+<ul>
+  <li><code>memory-backend-*</code></li>
+  <li><code>cryptodev-backend-*</code></li>
+  <li><code>rng-*</code></li>
+  <li><code>sev-*</code></li>
+</ul>
+
+<p>接口提供了 <code>complete()</code> 回调（类似 Device 的 realize，用于可失败的后初始化）。</p>
+
+<h2>6.9 Container 类型与 Composition Tree</h2>
+
+<pre><code><span class="cm">/* include/qom/object.h:29 */</span>
+<span class="ma">#define TYPE_CONTAINER "container"</span>
+
+<span class="cm">/* qom/object.c:1672 —— root containers */</span>
+<span class="kw">static const char</span> *<span class="kw">const</span> root_containers[] = {
+    <span class="str">"/objects"</span>,      <span class="cm">/* -object 创建的东西在这 */</span>
+    <span class="str">"/machine"</span>,      <span class="cm">/* Machine 和所有板载设备 */</span>
+    <span class="str">"/peripheral"</span>,   <span class="cm">/* -device 热插拔设备 */</span>
+    <span class="str">"/peripheral-anon"</span>,
+};</code></pre>
+
+<div class="ascii-box type-hierarchy">
+  / (root container)
+  ├─ /objects
+  │    ├─ mem0 (memory-backend-ram)
+  │    └─ cryptodev0 (cryptodev-backend-builtin)
+  ├─ /machine
+  │    ├─ virt-machine
+  │    │    ├─ cpu[0], cpu[1], ...
+  │    │    ├─ gic (arm-gic-v3)
+  │    │    ├─ uart0 (pl011)
+  │    │    └─ pcie.0 (PCIe root complex)
+  │    │         ├─ e1000.0
+  │    │         └─ virtio-blk.0
+  │    └─ ...
+  └─ /peripheral
+       └─ (热插拔设备)
+</div>
+
+<p><code>info qom-tree</code> 在 QEMU monitor 中展示的就是这棵 composition tree。</p>
+
+<h2>6.10 完整的类型分布一览</h2>
+
+<table>
+  <tr><th>类别</th><th>基类型</th><th>示例子类型</th><th>在哪定义</th></tr>
+  <tr><td>Root</td><td>"object"</td><td>— (abstract)</td><td>qom/object.c</td></tr>
+  <tr><td>Device</td><td>"device"</td><td>"sys-bus-device", "pci-device"</td><td>hw/core/qdev.c</td></tr>
+  <tr><td>SysBus Dev</td><td>"sys-bus-device"</td><td>"edu", "serial", "pl011"</td><td>hw/core/sysbus.c</td></tr>
+  <tr><td>PCI Dev</td><td>"pci-device"</td><td>"e1000", "virtio-net-pci"</td><td>hw/pci/pci.c</td></tr>
+  <tr><td>Machine</td><td>"machine"</td><td>"virt", "pc-q35-6.2"</td><td>hw/core/machine.c</td></tr>
+  <tr><td>Bus</td><td>"bus"</td><td>"PCI", "System", "I2C"</td><td>hw/core/bus.c</td></tr>
+  <tr><td>Memory</td><td>"memory-backend"</td><td>"memory-backend-ram"</td><td>backends/hostmem.c</td></tr>
+  <tr><td>IRQ</td><td>"irq"</td><td>—</td><td>hw/core/irq.c</td></tr>
+  <tr><td>Interface</td><td>"user-creatable"</td><td>(implemented by memory-backend-*, etc.)</td><td>qom/object_interfaces.c</td></tr>
+  <tr><td>Resettable</td><td>"resettable"</td><td>(implemented by all devices since QEMU 5.0)</td><td>hw/core/resettable.h</td></tr>
+</table>
+
+<div class="note">
+  <strong>快速 grep：</strong>在 QEMU 源码中搜索所有 QOM 类型：
+  <pre><code>grep -r 'TYPE_\w\+\s\+"' include/ | grep '#define TYPE_'</code></pre>
+  这列出了约 <strong>800+</strong> 个 QOM 类型定义。
+</div>
+
+<h2>6.11 运行时观察类型树</h2>
+
+<pre><code><span class="cm"># 启动 QEMU 后, 在 monitor 中:</span>
+(qemu) info qom-tree             <span class="cm"># 查看 composition tree</span>
+(qemu) qom-list /machine         <span class="cm"># 列出 /machine 下的子对象和属性</span>
+(qemu) qom-get /machine/uart0 type  <span class="cm"># 查看 uart0 的类型名</span>
+(qemu) device_add edu            <span class="cm"># 动态添加设备 (要求 user_creatable=true)</span>
+(qemu) object_add memory-backend-ram,id=mem1,size=512M  <span class="cm"># 动态添加对象</span></code></pre>
+
+<h2>本模块小结</h2>
+
+<table>
+  <tr><th>类型</th><th>作用</th><th>是否可实例化</th></tr>
+  <tr><td>"object"</td><td>根类型</td><td>abstract</td></tr>
+  <tr><td>"device"</td><td>所有设备的基类</td><td>abstract</td></tr>
+  <tr><td>"bus"</td><td>所有总线的基类</td><td>abstract</td></tr>
+  <tr><td>"sys-bus-device"</td><td>系统总线设备</td><td>abstract</td></tr>
+  <tr><td>"pci-device"</td><td>PCI 设备</td><td>abstract</td></tr>
+  <tr><td>"machine"</td><td>Machine 平台</td><td>concrete subtypes</td></tr>
+  <tr><td>"memory-backend"</td><td>内存后端</td><td>abstract</td></tr>
+  <tr><td>"user-creatable"</td><td>接口 (interface)</td><td>N/A</td></tr>
+  <tr><td>"container"</td><td>composition tree 容器节点</td><td>concrete</td></tr>
+</table>
+
+<div class="footer">
+  <p><a href="05-inheritance.html">← #05 Inheritance</a> | <a href="index.html">Portal</a> | <a href="07-capstone.html">#07 Capstone →</a></p>
+  <p>Source: QEMU <code>master</code> @ <code>ac0cc20ad2</code> — 2026-07-21</p>
+</div>
+
+</body>
+</html>

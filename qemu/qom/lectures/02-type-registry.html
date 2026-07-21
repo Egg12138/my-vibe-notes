@@ -1,0 +1,288 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>#02 类型注册与发现 — QEMU QOM 教学</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="top-nav">
+  <a href="index.html">Portal</a>
+  <span class="sep">|</span>
+  <a href="01-motivation.html">#01 Motivation</a>
+  <span class="sep">|</span>
+  <span class="current">#02 Registry</span>
+  <span class="sep">|</span>
+  <a href="03-lifecycle.html">#03 Lifecycle</a>
+  <span class="sep">|</span>
+  <a href="04-properties.html">#04 Properties</a>
+  <span class="sep">|</span>
+  <a href="05-inheritance.html">#05 Inheritance</a>
+  <span class="sep">|</span>
+  <a href="06-type-landscape.html">#06 Landscape</a>
+  <span class="sep">|</span>
+  <a href="07-capstone.html">#07 Capstone</a>
+</div>
+
+<h1>#02 类型注册与发现</h1>
+
+<p>
+QOM 的核心是一个 <strong>全局类型注册表</strong>。每种 QOM 类型必须先注册到这个表中，
+之后才能被查找和实例化。这一讲深入类型注册的完整链路。
+</p>
+
+<h2>2.1 TypeInfo —— 类型蓝图</h2>
+
+<p>
+<code>TypeInfo</code> 是向 QOM 注册类型的 "申请表"。它定义在 <code>include/qom/object.h</code>：
+</p>
+
+<pre><code><span class="cm">/* include/qom/object.h:476 */</span>
+<span class="kw">struct</span> <span class="ty">TypeInfo</span>
+{
+    <span class="kw">const char</span> *name;             <span class="cm">/* 类型字符串名称，必须是全局唯一的 */</span>
+    <span class="kw">const char</span> *parent;           <span class="cm">/* 父类型的名称 */</span>
+
+    <span class="ty">size_t</span> instance_size;         <span class="cm">/* 实例结构体的大小 (sizeof(MyDevice)) */</span>
+    <span class="ty">size_t</span> instance_align;        <span class="cm">/* 实例内存对齐要求 */</span>
+    <span class="kw">void</span> (*instance_init)(Object *obj);
+    <span class="kw">void</span> (*instance_post_init)(Object *obj);
+    <span class="kw">void</span> (*instance_finalize)(Object *obj);
+
+    <span class="kw">bool</span> abstract;                <span class="cm">/* 抽象类型不能被直接实例化 */</span>
+    <span class="ty">size_t</span> class_size;            <span class="cm">/* Class 结构体的大小 (sizeof(MyDeviceClass)) */</span>
+
+    <span class="kw">void</span> (*class_init)(ObjectClass *klass, <span class="kw">const void</span> *data);
+    <span class="kw">void</span> (*class_base_init)(ObjectClass *klass, <span class="kw">const void</span> *data);
+    <span class="kw">const void</span> *class_data;       <span class="cm">/* 传递给 class_init/class_base_init 的额外数据 */</span>
+
+    <span class="kw">const</span> InterfaceInfo *interfaces;  <span class="cm">/* 实现的接口列表 */</span>
+};</code></pre>
+
+<p>关键语义：</p>
+<ul>
+  <li><code>name</code> 是类型的 <strong>全限定名</strong>，类似于 C++ 的 <code>typeid(MyClass).name()</code></li>
+  <li><code>parent</code> 指向父类型的 name —— QOM 的继承链就是通过 <strong>字符串</strong> 串联的</li>
+  <li><code>class_size = 0</code> 表示该类型不增加任何 Class 字段，复用父类的 Class 大小</li>
+  <li><code>instance_size = 0</code> → 自动标记为 <code>abstract = true</code></li>
+  <li><code>class_init</code> 在该类型 <strong>自身</strong> 的 class 准备好后被调用（覆盖虚函数）</li>
+  <li><code>class_base_init</code> 在该类型 <strong>被用作父类型时</strong> 被调用（撤销 memcpy 的影响）</li>
+</ul>
+
+<div class="note">
+  <strong>class_base_init 的微妙用途：</strong>当子类型通过
+  <code>memcpy(child_class, parent_class, parent_class_size)</code> 继承了父类的 class 内容后，
+  父类的 class_base_init 被调用，给父类一个机会 <em>撤销</em> 某些不应当被继承的字段。
+  例如一个 class 成员 <code>bool subclassed</code>，父类自身应设为 <code>false</code>，但当子类继承后应设为 <code>true</code>。
+</div>
+
+<h2>2.2 TypeImpl —— 内部类型表示</h2>
+
+<p>
+<code>TypeInfo</code> 是公开的 "申请表"，QOM 内部用 <code>TypeImpl</code> 存储已注册的类型。
+定义在 <code>qom/object.c</code>：
+</p>
+
+<pre><code><span class="cm">/* qom/object.c:48 */</span>
+<span class="kw">struct</span> <span class="ty">TypeImpl</span>
+{
+    <span class="kw">const char</span> *name;
+
+    <span class="ty">size_t</span> class_size;
+    <span class="ty">size_t</span> instance_size;
+    <span class="ty">size_t</span> instance_align;
+
+    <span class="kw">void</span> (*class_init)(ObjectClass *klass, <span class="kw">const void</span> *data);
+    <span class="kw">void</span> (*class_base_init)(ObjectClass *klass, <span class="kw">const void</span> *data);
+    <span class="kw">const void</span> *class_data;
+
+    <span class="kw">void</span> (*instance_init)(Object *obj);
+    <span class="kw">void</span> (*instance_post_init)(Object *obj);
+    <span class="kw">void</span> (*instance_finalize)(Object *obj);
+
+    <span class="kw">bool</span> abstract;
+
+    <span class="kw">const char</span> *parent;
+    <span class="ty">TypeImpl</span> *parent_type;  <span class="cm">/* 懒加载：首次 type_get_parent() 时解析 */</span>
+
+    ObjectClass *class;        <span class="cm">/* 懒初始化：首次 type_initialize() 时分配 */</span>
+
+    <span class="kw">int</span> num_interfaces;
+    InterfaceImpl interfaces[MAX_INTERFACES];  <span class="cm">/* 最多 32 个接口 */</span>
+};</code></pre>
+
+<p>
+<code>TypeImpl</code> 与 <code>TypeInfo</code> 几乎是一一对应的，关键差异在于
+<code>TypeImpl</code> 包含 <strong>运行时解析结果</strong>：
+</p>
+<ul>
+  <li><code>parent_type</code> —— 从 parent 字符串解析出的实际 TypeImpl 指针</li>
+  <li><code>class</code> —— 分配好的 ObjectClass，在首次 type_initialize 时创建</li>
+  <li><code>instance_size</code> 和 <code>class_size</code> —— 经过继承链计算后的最终大小</li>
+</ul>
+
+<h2>2.3 类型注册流程</h2>
+
+<div class="ascii-box">
+type_register_static(&amp;my_type_info)
+  │
+  ├─ assert(info->parent != NULL)
+  │
+  └─ type_register_internal(info)
+       ├─ type_name_is_valid(name)     <span class="cm">/* 类型名必须是合法的 C identifier */</span>
+       ├─ ti = type_new(info)          <span class="cm">/* 从 TypeInfo 复制字段到新 TypeImpl */</span>
+       └─ type_table_add(ti)           <span class="cm">/* 插入全局 GHashTable */</span>
+</div>
+
+<p>核心实现在 <code>qom/object.c:163</code>：</p>
+
+<pre><code><span class="kw">static</span> TypeImpl *type_register_internal(<span class="kw">const</span> TypeInfo *info)
+{
+    TypeImpl *ti;
+
+    <span class="kw">if</span> (!type_name_is_valid(info->name)) {
+        fprintf(stderr, <span class="str">"Registering '%s' with illegal type name\n"</span>,
+                info->name);
+        abort();
+    }
+
+    ti = type_new(info);
+    type_table_add(ti);
+    <span class="kw">return</span> ti;
+}
+
+TypeImpl *type_register_static(<span class="kw">const</span> TypeInfo *info)
+{
+    assert(info->parent);   <span class="cm">/* 所有非根类型必须有 parent */</span>
+    <span class="kw">return</span> type_register_internal(info);
+}</code></pre>
+
+<p>
+<code>type_new()</code> 负责将 TypeInfo 各字段复制到新分配的 TypeImpl，但 <strong>不解析 parent</strong> —— 这被推迟到首次 type_get_parent() 时。
+<code>type_table_add()</code> 将 TypeImpl 插入全局哈希表，键为 <code>name</code> 字符串。
+</p>
+
+<h2>2.4 type_init —— 连接编译与注册</h2>
+
+<p>
+每个类型的注册函数如何被调用？答案是 <code>type_init</code> 宏和 GCC 的
+<code>__attribute__((constructor))</code>：
+</p>
+
+<pre><code><span class="cm">/* include/qemu/module.h:56 */</span>
+<span class="ma">#define type_init(function) module_init(function, MODULE_INIT_QOM)</span>
+
+<span class="cm">/* module_init 展开后 (简化版 on Linux): */</span>
+<span class="ma">#define module_init(function, type)                              \</span>
+<span class="ma">    static void __attribute__((constructor)) do_qemu_init_ ## function(void) \</span>
+<span class="ma">    {                                                            \</span>
+<span class="ma">        register_module_init(function, type);                    \</span>
+<span class="ma">    }</span></code></pre>
+
+<div class="ascii-box">
+  main()
+    │
+    ├─ (constructor functions run before main)
+    │    └─ register_module_init(my_register_types, MODULE_INIT_QOM)
+    │         └─ 将 my_register_types 加入 init_funcs[MODULE_INIT_QOM] 链表
+    │
+    └─ qemu_init()
+         └─ module_call_init(MODULE_INIT_QOM)
+              └─ 遍历 init_funcs[MODULE_INIT_QOM] 链表
+                   └─ 调用 my_register_types()
+                        └─ type_register_static(&my_type_info)  ★ 真正注册发生在这里！
+</div>
+
+<p>
+关键点：<code>type_init</code> 不直接注册类型 —— 它只是把注册函数挂到一个队列里，
+等到 <code>module_call_init(MODULE_INIT_QOM)</code> 时统一执行。
+这样能保证所有 module 的 constructor 跑完后，才统一注册和初始化类型。
+</p>
+
+<div class="note">
+  <strong>启动顺序保证：</strong>QEMU 按特定顺序调用 <code>module_call_init()</code>：
+  MIGRATION → BLOCK → OPTS → <strong>QOM</strong> → TRACE → XEN_BACKEND → LIBQOS → FUZZ_TARGET。
+  QOM 在 OPTS 之后、TRACE 之前，所以 QOM 类型可以引用 opts 解析出的配置。
+</div>
+
+<h2>2.5 类型的查找与动态加载</h2>
+
+<pre><code><span class="cm">/* 简单查找 —— 只在已注册的表中查，不触发 module 加载 */</span>
+<span class="kw">static</span> TypeImpl *type_get_by_name_noload(<span class="kw">const char</span> *name)
+{
+    <span class="kw">if</span> (name == NULL) <span class="kw">return</span> NULL;
+    <span class="kw">return</span> type_table_lookup(name);
+}
+
+<span class="cm">/* 完整查找 —— 找不到时尝试加载 module */</span>
+<span class="kw">static</span> TypeImpl *type_get_or_load_by_name(<span class="kw">const char</span> *name, Error **errp)
+{
+    TypeImpl *type = type_get_by_name_noload(name);
+<span class="ma">#ifdef CONFIG_MODULES</span>
+    <span class="kw">if</span> (!type) {
+        <span class="kw">int</span> rv = module_load_qom(name, errp);  <span class="cm">/* 尝试加载 .so 文件 */</span>
+        <span class="kw">if</span> (rv > 0) {
+            type = type_get_by_name_noload(name);   <span class="cm">/* 模块加载后重试 */</span>
+        }
+    }
+<span class="ma">#endif</span>
+    <span class="kw">if</span> (!type) {
+        error_setg(errp, <span class="str">"unknown type '%s'"</span>, name);
+    }
+    <span class="kw">return</span> type;
+}</code></pre>
+
+<p>
+<code>module_load_qom()</code> 是 QEMU 的模块系统：当类型不在已注册表中时，
+它会尝试加载 <code>hw-arm-virt.so</code> 或 <code>hw-usb-host.so</code> 这样的共享库。
+这些 .so 文件在加载时执行其 constructor（即 <code>type_init</code> 注册的函数），
+从而向全局表注册新的类型。
+</p>
+
+<h2>2.6 类型名的命名约定</h2>
+
+<p>
+QOM 类型名遵循严格的模板风格：
+</p>
+
+<table>
+  <tr><th>模式</th><th>示例</th><th>说明</th></tr>
+  <tr><td><code>"object"</code></td><td>TYPE_OBJECT</td><td>根类型</td></tr>
+  <tr><td><code>"device"</code></td><td>TYPE_DEVICE</td><td>设备基类</td></tr>
+  <tr><td><code>"bus"</code></td><td>TYPE_BUS</td><td>总线基类</td></tr>
+  <tr><td><code>"pci-device"</code></td><td>TYPE_PCI_DEVICE</td><td>PCI 设备</td></tr>
+  <tr><td><code>"sys-bus-device"</code></td><td>TYPE_SYS_BUS_DEVICE</td><td>系统总线设备</td></tr>
+  <tr><td><code>"machine"</code></td><td>TYPE_MACHINE</td><td>Machine 类型</td></tr>
+  <tr><td><code>"memory-backend-ram"</code></td><td>TYPE_MEMORY_BACKEND_RAM</td><td>内存后端</td></tr>
+  <tr><td><code>"<i>&lt;vendor&gt;</i>-<i>&lt;device&gt;</i>"</code></td><td><code>"e1000"</code>, <code>"virtio-net-pci"</code></td><td>具体设备</td></tr>
+</table>
+
+<p>对应的 C 宏约定：</p>
+<ul>
+  <li><code>TYPE_<i>MODULE_OBJ_NAME</i></code> → 类型名字符串 (如 <code>TYPE_DEVICE</code> → <code>"device"</code>)</li>
+  <li><code>OBJECT_DECLARE_TYPE(DeviceState, DeviceClass, DEVICE)</code> → 生成 cast helpers</li>
+  <li><code>OBJECT_DEFINE_TYPE(DeviceState, device, DEVICE, OBJECT)</code> → 生成 TypeInfo + 注册函数</li>
+</ul>
+
+<h2>本模块小结</h2>
+
+<table>
+  <tr><th>概念</th><th>含义</th></tr>
+  <tr><td>TypeInfo</td><td>公开的注册 "申请表"，描述类型的元信息</td></tr>
+  <tr><td>TypeImpl</td><td>内部的类型存储，包含懒解析的 parent_type 和 class</td></tr>
+  <tr><td>type_register_static</td><td>注册一个静态定义的 TypeInfo</td></tr>
+  <tr><td>type_init(fn)</td><td>GCC constructor 宏，将注册函数排入 MODULE_INIT_QOM 队列</td></tr>
+  <tr><td>module_call_init(QOM)</td><td>QEMU 初始化阶段调用所有 type_init 注册的函数</td></tr>
+  <tr><td>type_table</td><td>全局 GHashTable，以 name 为键，TypeImpl 为值</td></tr>
+  <tr><td>module_load_qom</td><td>找不到类型时动态加载 .so 模块</td></tr>
+</table>
+
+<div class="footer">
+  <p><a href="01-motivation.html">← #01 Motivation</a> | <a href="index.html">Portal</a> | <a href="03-lifecycle.html">#03 Lifecycle →</a></p>
+  <p>Source: QEMU <code>master</code> @ <code>ac0cc20ad2</code> — 2026-07-21</p>
+</div>
+
+</body>
+</html>

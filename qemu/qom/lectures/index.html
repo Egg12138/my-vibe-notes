@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>QEMU QOM 深度教学</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<h1>QEMU QOM (QEMU Object Model) 深度教学</h1>
+
+<p>
+QOM 是 QEMU 的类型系统 —— 它是 QEMU 中所有设备、总线、Machine、MemoryBackend 的基石。
+这套讲座从 C 语言 OOP 的困境出发，逐层深入到 QOM 的类型注册、生命周期、属性系统、继承与接口，
+最终通过一个完整的实战案例，让你能够定义自己的 QOM 类型。
+</p>
+
+<p style="color: var(--comment);">
+所有代码示例均来自 QEMU <code>include/qom/object.h</code>, <code>qom/object.c</code>,
+<code>include/hw/qdev-core.h</code>, <code>hw/core/qdev.c</code> 等实际源文件。
+</p>
+
+<h2>模块索引</h2>
+
+<a href="01-motivation.html">
+<div class="module-card">
+  <h3><span class="num">#01</span> QOM 的设计动机与核心思想</h3>
+  <div class="topics">C 语言的 OOP 困境 · QEMU 1.x 的静态设备模型 · QOM 三层抽象 (Type → Class → Object) · 与 GObject 的关系</div>
+</div>
+</a>
+
+<a href="02-type-registry.html">
+<div class="module-card">
+  <h3><span class="num">#02</span> 类型注册与发现</h3>
+  <div class="topics">TypeInfo 结构 · TypeImpl 内部实现 · type_register_static · type_init 宏 · type_table 全局哈希表 · module_load_qom 动态加载</div>
+</div>
+</a>
+
+<a href="03-lifecycle.html">
+<div class="module-card">
+  <h3><span class="num">#03</span> 对象与类的生命周期</h3>
+  <div class="topics">ObjectClass 与 Object 结构 · type_initialize 完整流程 · class_init vs instance_init · 设备的两阶段构造 (init + realize)</div>
+</div>
+</a>
+
+<a href="04-properties.html">
+<div class="module-card">
+  <h3><span class="num">#04</span> QOM 属性系统</h3>
+  <div class="topics">ObjectProperty 结构 · Visitor pattern · object_property_add · Static properties · qom-list/get/set · -object 命令行</div>
+</div>
+</a>
+
+<a href="05-inheritance.html">
+<div class="module-card">
+  <h3><span class="num">#05</span> 继承、接口与类型转换</h3>
+  <div class="topics">Type hierarchy · InterfaceInfo · OBJECT_CHECK / object_dynamic_cast · OBJECT_DECLARE_TYPE 宏展开 · Cast cache</div>
+</div>
+</a>
+
+<a href="06-type-landscape.html">
+<div class="module-card">
+  <h3><span class="num">#06</span> QEMU 中的 QOM 类型全景图</h3>
+  <div class="topics">TYPE_OBJECT → TYPE_DEVICE → TYPE_PCI_DEVICE · Machine · Bus · MemoryBackend · UserCreatable · Container · info qom-tree</div>
+</div>
+</a>
+
+<a href="07-capstone.html">
+<div class="module-card">
+  <h3><span class="num">#07</span> 实战：新增自定义 QOM 类型</h3>
+  <div class="topics">完整示例: OBJECT_DECLARE_TYPE + OBJECT_DEFINE_TYPE + class_init + instance_init + properties + realize + device_add</div>
+</div>
+</a>
+
+<div class="footer">
+  <p>Generated from QEMU source tree — branch <code>master</code>, commit <code>ac0cc20ad2</code> — 2026-07-21</p>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>#04 QOM 属性系统 — QEMU QOM 教学</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="top-nav">
+  <a href="index.html">Portal</a>
+  <span class="sep">|</span>
+  <a href="01-motivation.html">#01</a> <span class="sep">|</span>
+  <a href="02-type-registry.html">#02</a> <span class="sep">|</span>
+  <a href="03-lifecycle.html">#03</a> <span class="sep">|</span>
+  <span class="current">#04 Properties</span>
+  <span class="sep">|</span>
+  <a href="05-inheritance.html">#05</a> <span class="sep">|</span>
+  <a href="06-type-landscape.html">#06</a> <span class="sep">|</span>
+  <a href="07-capstone.html">#07</a>
+</div>
+
+<h1>#04 QOM 属性系统</h1>
+
+<p>
+属性系统是 QOM 的 "魔法"——它让你能在运行时自省和修改对象，
+是 QMP monitor 中 <code>qom-list</code>/<code>qom-get</code>/<code>qom-set</code> 的底层机制，
+也是 <code>-device pci-device,property=value</code> 命令行参数的工作方式。
+</p>
+
+<h2>4.1 ObjectProperty 结构</h2>
+
+<pre><code><span class="cm">/* include/qom/object.h:89 */</span>
+<span class="kw">struct</span> <span class="ty">ObjectProperty</span>
+{
+    <span class="kw">char</span> *name;                      <span class="cm">/* 属性名称 */</span>
+    <span class="kw">char</span> *type;                      <span class="cm">/* 属性类型描述 (QAPI type) */</span>
+    <span class="kw">char</span> *description;               <span class="cm">/* 人类可读的描述 */</span>
+    ObjectPropertyAccessor *get;     <span class="cm">/* getter: (obj, visitor, name, opaque, errp) */</span>
+    ObjectPropertyAccessor *set;     <span class="cm">/* setter: 同上 */</span>
+    ObjectPropertyResolve *resolve;  <span class="cm">/* 路径解析 (用于 child<> 属性) */</span>
+    ObjectPropertyRelease *release;  <span class="cm">/* 属性被删除时的回调 */</span>
+    ObjectPropertyInit *init;        <span class="cm">/* 属性创建时的回调 */</span>
+    <span class="kw">void</span> *opaque;                    <span class="cm">/* 传递给 get/set 的不透明数据 */</span>
+    QObject *defval;                 <span class="cm">/* 默认值 */</span>
+};</code></pre>
+
+<p>
+属性的核心是 <strong>Visitor 模式</strong>——getter 和 setter 不直接读写值，
+而是通过 <code>Visitor</code> 接口间接操作。
+</p>
+
+<h2>4.2 Visitor 模式</h2>
+
+<p>
+QOM 属性不直接返回 <code>int</code> 或 <code>char*</code>，而是使用 Visitor：
+</p>
+
+<pre><code><span class="cm">/* include/qom/object.h:43 */</span>
+<span class="kw">typedef void</span> (ObjectPropertyAccessor)(Object *obj,
+                                      Visitor *v,
+                                      <span class="kw">const char</span> *name,
+                                      <span class="kw">void</span> *opaque,
+                                      Error **errp);</code></pre>
+
+<div class="ascii-box">
+                     ┌──────────────┐
+  qom-get "mac" ──→  │ StringOutput │  ← visitor 负责"收集"值
+                     │   Visitor    │
+                     └──────┬───────┘
+                            │ visit_type_str(v, "52:54:00:12:34:56")
+                            ▼
+                     ┌──────────────┐
+                     │ nic_get_mac  │  ← getter 负责"提供"值
+                     └──────┬───────┘
+                            │ NICState.mac[]
+                     ┌──────┴───────┐
+                     │ NICState     │
+                     └──────────────┘
+
+                     ┌──────────────┐
+  qom-set "mac" ──→ │ StringInput  │  ← visitor 负责"携带"新值
+                     │   Visitor    │
+                     └──────┬───────┘
+                            │ visit_type_str(v, "52:54:00:ab:cd:ef")
+                            ▼
+                     ┌──────────────┐
+                     │ nic_set_mac  │  ← setter 负责"应用"值
+                     └──────┬───────┘
+                            │ NICState.mac[] = ...
+                     ┌──────┴───────┐
+                     │ NICState     │
+                     └──────────────┘
+</div>
+
+<p>
+Visitor 是读/写通道的抽象。同一套 getter/setter 逻辑，换上不同 Visitor
+就能支持不同序列化格式（JSON、QMP、字符串）。这是一种经典的 <em>双调派 (double dispatch)</em> 模式：
+<code>visitor.visit_X(obj.field)</code> → visitor 知道自己要做什么（序列化/反序列化），
+obj 知道自己有哪些字段。
+</p>
+
+<h2>4.3 object_property_add —— 添加属性</h2>
+
+<pre><code><span class="cm">/* include/qom/object.h:1107 */</span>
+ObjectProperty *object_property_add(Object *obj, <span class="kw">const char</span> *name,
+                                    <span class="kw">const char</span> *type,
+                                    ObjectPropertyAccessor *get,
+                                    ObjectPropertyAccessor *set,
+                                    ObjectPropertyRelease *release,
+                                    <span class="kw">void</span> *opaque);</code></pre>
+
+<p>添加属性的典型用法（在 <code>instance_init</code> 中）：</p>
+
+<pre><code><span class="kw">static void</span> my_device_init(Object *obj)
+{
+    MyDevice *dev = MY_DEVICE(obj);
+
+    <span class="cm">/* 方式 1: 手动添加属性，自定义 getter/setter */</span>
+    object_property_add(obj, <span class="str">"mac"</span>, <span class="str">"str"</span>,
+                        my_device_get_mac,
+                        my_device_set_mac, NULL, dev);
+
+    <span class="cm">/* 方式 2: 添加子对象 (child&lt;&gt; 属性) */</span>
+    object_property_add_child(obj, <span class="str">"mmio[0]"</span>, OBJECT(&amp;dev->mmio));
+}</code></pre>
+
+<p>QOM 还有一系列属性便捷包装：</p>
+
+<pre><code><span class="cm">/* 标量类型属性 */</span>
+object_property_add_uint8_ptr(obj, <span class="str">"revision"</span>, &amp;dev->revision);
+object_property_add_uint32_ptr(obj, <span class="str">"freq_hz"</span>, &amp;dev->freq_hz);
+object_property_add_bool(obj, <span class="str">"enabled"</span>,
+                         my_get_enabled, my_set_enabled);
+
+<span class="cm">/* Link 属性 —— 指向另一个 QOM 对象的链接 */</span>
+object_property_add_link(obj, <span class="str">"dma"</span>, TYPE_DMA_ENGINE,
+                         (Object **)&amp;dev->dma,
+                         NULL, OBJ_PROP_LINK_STRONG);
+</code></pre>
+
+<h2>4.4 Static Properties（静态属性）</h2>
+
+<p>
+手动 <code>object_property_add</code> 对每个对象都要执行。
+设备更常用的是 <strong>静态属性表</strong> —— 在 class_init 中一次性注册，
+每个实例自动拥有：
+</p>
+
+<pre><code><span class="cm">/* 在 class_init 中: */</span>
+<span class="kw">static</span> Property my_device_properties[] = {
+    DEFINE_PROP_UINT32(<span class="str">"freq"</span>,    MyDevice, freq_hz, 1000000),
+    DEFINE_PROP_STRING(<span class="str">"serial"</span>,   MyDevice, serial),
+    DEFINE_PROP_BOOL(<span class="str">"enabled"</span>,  MyDevice, enabled, <span class="kw">true</span>),
+    DEFINE_PROP_MACADDR(<span class="str">"mac"</span>,   MyDevice, mac),
+    DEFINE_PROP_END_OF_LIST(),
+};
+
+<span class="kw">static void</span> my_device_class_init(ObjectClass *oc, <span class="kw">void</span> *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    device_class_set_props(dc, my_device_properties);
+}</code></pre>
+
+<p>
+<code>DEFINE_PROP_UINT32("freq", MyDevice, freq_hz, 1000000)</code> 的语义：
+创建一个名为 <code>"freq"</code> 的属性，getter/setter 自动读写
+<code>MyDevice</code> 结构体的 <code>freq_hz</code> 字段，默认值 <code>1000000</code>。
+</p>
+
+<div class="note">
+  <strong>Static vs Dynamic 属性：</strong>
+  <ul>
+    <li><strong>Static</strong> (Property struct): class_init 中注册，所有实例共享元信息，通过 property offset 直接读写 struct 字段，性能高</li>
+    <li><strong>Dynamic</strong> (object_property_add): instance_init 中注册，getter/setter 是自定义函数，灵活性高</li>
+  </ul>
+</div>
+
+<h2>4.5 属性子类型</h2>
+
+<table>
+  <tr><th>类型</th><th>API</th><th>用途</th></tr>
+  <tr><td>child&lt;&gt;</td><td>object_property_add_child</td><td>composition tree 父子链接</td></tr>
+  <tr><td>link&lt;&gt;</td><td>object_property_add_link</td><td>跨树的对象引用 (软/硬链接)</td></tr>
+  <tr><td>bool</td><td>object_property_add_bool</td><td>布尔开关</td></tr>
+  <tr><td>str</td><td>object_property_add_str</td><td>字符串</td></tr>
+  <tr><td>uint32</td><td>object_property_add_uint32_ptr</td><td>32 位无符号整数</td></tr>
+</table>
+
+<div class="warn">
+  <strong>child 属性是 composition tree 的边</strong> —— 当你调用
+  <code>object_property_add_child(parent, "nic", nic_obj)</code> 时，
+  实际上做了两件事：(1) 在 parent 上创建名为 "nic" 的 child&lt;&gt; 属性；
+  (2) 设置 <code>nic_obj->parent = parent</code>，把 nic 挂到 composition tree 上。
+  <code>qom-tree</code> 显示的就是这棵 composition tree。
+</div>
+
+<h2>4.6 QMP Monitor 交互</h2>
+
+<p>属性系统的直接体现就是 QMP monitor 中的 QOM 命令：</p>
+
+<pre><code><span class="cm">(QEMU) info qom-tree</span>
+/machine (virt-machine)
+  /peripheral (container)
+  /unattached (container)
+    /device[0] (e1000)
+      /mac = "52:54:00:12:34:56"  <span class="cm">← 这就是 object_property_add 的效果</span>
+      /freq = 1000000
+      /enabled = true
+
+<span class="cm">(QEMU) qom-list /machine/peripheral</span>
+device[0] (child&lt;e1000&gt;)
+
+<span class="cm">(QEMU) qom-get /machine/peripheral/device[0] mac</span>
+"52:54:00:12:34:56"
+
+<span class="cm">(QEMU) qom-set /machine/peripheral/device[0] mac "52:54:00:ab:cd:ef"</span>
+<span class="cm">(QEMU) qom-get /machine/peripheral/device[0] mac</span>
+"52:54:00:ab:cd:ef"</code></pre>
+
+<h2>4.7 命令行参数与属性</h2>
+
+<p>
+<code>-device e1000,mac=52:54:00:12:34:56,freq=1000000</code> 的工作链路：
+</p>
+
+<div class="ascii-box">
+  qemu-system-x86_64 -device e1000,mac=52:54:00:12:34:56
+    │
+    ├─ [1] QemuOpts 解析: { "driver" → "e1000", "mac" → "52:54:..." }
+    │
+    ├─ [2] object_new("e1000")  ← 创建实例, instance_init
+    │
+    ├─ [3] object_set_properties_from_qdict(obj, opts)
+    │       └─ for each key-value:
+    │            object_property_set(obj, "mac", "52:54:...", &err)
+    │              └─ prop->set(obj, string_input_visitor, "mac", prop->opaque, &err)
+    │
+    └─ [4] qdev_device_add_from_qdict(opts, &err)
+             └─ device_set_realized(dev, true, &err)
+                  └─ DeviceClass::realize(dev, &err)
+</div>
+
+<p>类似的，<code>-object memory-backend-ram,id=mem0,size=1G</code> 也是同一套链路：</p>
+
+<pre><code><span class="cm">/* backends/hostmem.c 中定义: */</span>
+<span class="kw">static</span> Property host_memory_backend_properties[] = {
+    DEFINE_PROP_SIZE(<span class="str">"size"</span>, HostMemoryBackend, size, 0),
+    DEFINE_PROP_BOOL(<span class="str">"share"</span>, HostMemoryBackend, share, <span class="kw">false</span>),
+    ...
+};
+
+<span class="cm">/* 用户通过 -object memory-backend-ram,id=mem0,size=1G,share=on
+   设置 HostMemoryBackend.size 和 HostMemoryBackend.share 字段 */</span></code></pre>
+
+<h2>本模块小结</h2>
+
+<table>
+  <tr><th>概念</th><th>含义</th></tr>
+  <tr><td>ObjectProperty</td><td>描述属性的结构体: name, type, get, set, opaque</td></tr>
+  <tr><td>Visitor</td><td>getter/setter 的读写通道抽象, 支持多种序列化格式</td></tr>
+  <tr><td>object_property_add</td><td>动态添加属性 (instance_init 中使用)</td></tr>
+  <tr><td>DEFINE_PROP_* / Property[]</td><td>静态属性表, class_init 中注册, 自动读写 struct 字段</td></tr>
+  <tr><td>child&lt;&gt;</td><td>composition tree 链接, 同时创建属性 + 设置 parent</td></tr>
+  <tr><td>qom-list/get/set</td><td>QMP monitor 中运行时自省的接口</td></tr>
+  <tr><td>-device / -object</td><td>命令行参数 → QemuOpts → object_set_properties → setter</td></tr>
+</table>
+
+<div class="footer">
+  <p><a href="03-lifecycle.html">← #03 Lifecycle</a> | <a href="index.html">Portal</a> | <a href="05-inheritance.html">#05 Inheritance →</a></p>
+  <p>Source: QEMU <code>master</code> @ <code>ac0cc20ad2</code> — 2026-07-21</p>
+</div>
+
+</body>
+</html>

@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>#03 对象与类的生命周期 — QEMU QOM 教学</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="top-nav">
+  <a href="index.html">Portal</a>
+  <span class="sep">|</span>
+  <a href="01-motivation.html">#01</a>
+  <span class="sep">|</span>
+  <a href="02-type-registry.html">#02</a>
+  <span class="sep">|</span>
+  <span class="current">#03 Lifecycle</span>
+  <span class="sep">|</span>
+  <a href="04-properties.html">#04</a>
+  <span class="sep">|</span>
+  <a href="05-inheritance.html">#05</a>
+  <span class="sep">|</span>
+  <a href="06-type-landscape.html">#06</a>
+  <span class="sep">|</span>
+  <a href="07-capstone.html">#07</a>
+</div>
+
+<h1>#03 对象与类的生命周期</h1>
+
+<h2>3.1 Object 与 ObjectClass —— 两个核心结构</h2>
+
+<pre><code><span class="cm">/* include/qom/object.h:128 */</span>
+<span class="kw">struct</span> <span class="ty">ObjectClass</span>
+{
+    <span class="ty">Type</span> type;                                    <span class="cm">/* 回指 TypeImpl */</span>
+    GSList *interfaces;                            <span class="cm">/* 实现的接口链表 */</span>
+    <span class="kw">const char</span> *object_cast_cache[4];             <span class="cm">/* 类型转换缓存 */</span>
+    <span class="kw">const char</span> *class_cast_cache[4];
+    ObjectUnparent *unparent;                      <span class="cm">/* 从 composition tree 移除时的回调 */</span>
+    GHashTable *properties;                        <span class="cm">/* 该类的所有属性 */</span>
+};
+
+<span class="cm">/* include/qom/object.h:154 */</span>
+<span class="kw">struct</span> <span class="ty">Object</span>
+{
+    ObjectClass *class;    <span class="cm">/* 指向类型对应的 ObjectClass ★ 必须是第一个字段 */</span>
+    ObjectFree *free;      <span class="cm">/* 析构函数 */</span>
+    GHashTable *properties; <span class="cm">/* 实例级别的属性 */</span>
+    uint32_t ref;          <span class="cm">/* 引用计数 */</span>
+    Object *parent;        <span class="cm">/* composition tree 中的父对象 */</span>
+};</code></pre>
+
+<div class="note">
+  <strong>C 语言 OOP 的关键技巧：</strong><code>class</code> 必须是 <code>Object</code> 的第一个字段。
+  这保证了 <code>Object</code> 和其所有子类型（如 <code>DeviceState</code>）的指针可以安全地强制转换为
+  <code>Object*</code>。C 标准保证结构体首字段与结构体自身有相同的地址。
+</div>
+
+<h2>3.2 type_initialize —— Class 的诞生</h2>
+
+<p>
+Class 不是随 TypeInfo 一起注册就创建的。它是 <strong>懒初始化的</strong> ——
+第一次有人需要这个类型时（查找、实例化），才会调用 <code>type_initialize()</code>。
+下面是完整的初始化流程：
+</p>
+
+<div class="ascii-box lifecycle">
+type_initialize(ti)              <span class="cm">/* qom/object.c:336 */</span>
+  │
+  ├─ [1] ti->class_size = type_class_get_size(ti)
+  │      <span class="cm">/* 如果 class_size==0, 递归取父类的 class_size */</span>
+  │
+  ├─ [2] ti->instance_size = type_object_get_size(ti)
+  │      <span class="cm">/* 如果 instance_size==0 → 标记为 abstract */</span>
+  │
+  ├─ [3] ti->class = g_malloc0(ti->class_size)
+  │      <span class="cm">/* 分配 Class 内存 */</span>
+  │
+  ├─ [4] type_initialize(parent)      <span class="cm">/* 递归初始化父类型 */</span>
+  │
+  ├─ [5] memcpy(ti->class, parent->class, parent->class_size)
+  │      <span class="cm">/* ★ 核心：从父类 memcpy 整个 vtable！ */</span>
+  │      <span class="cm">/* 这样父类的虚函数指针被子类自动继承 */</span>
+  │
+  ├─ [6] 处理 interfaces
+  │      ├─ 拷贝父类的 interface 实现
+  │      └─ type_initialize_interface() 初始化自己的接口
+  │
+  ├─ [7] ti->class->properties = g_hash_table_new(...)
+  │
+  ├─ [8] ti->class->type = ti       <span class="cm">/* 回指 TypeImpl */</span>
+  │
+  ├─ [9] 执行 class_base_init 链（从最远的祖先到最近）
+  │      for parent in ancestors(root → self.parent):
+  │          if parent->class_base_init:
+  │              parent->class_base_init(ti->class, ti->class_data)
+  │
+  └─ [10] ti->class_init(ti->class, ti->class_data)
+          <span class="cm">/* 覆盖虚函数指针，定义该类的行为 */</span>
+</div>
+
+<p>步骤 [5] 的 <code>memcpy</code> 是 QOM 继承机制的核心：</p>
+<ul>
+  <li>子类的 Class 内存大小 ≥ 父类的 Class 内存大小（在 step [1] 中保证）</li>
+  <li><code>memcpy</code> 把父类 Class 的 <strong>全部内容</strong> 复制到子类 Class 的起始位置</li>
+  <li>如果父类的 <code>class_init</code> 设置了某个函数指针（如 <code>realize = my_realize</code>），子类自动继承了它</li>
+  <li>子类的 <code>class_init</code> 可以做覆盖：<code>dc->realize = my_sub_realize</code></li>
+</ul>
+
+<div class="warn">
+  <strong>class_base_init 的陷阱：</strong>
+  如果父类型在 class_init 中设置了一个字段（比如分配了一个 buffer），
+  这个 buffer 会被 memcpy 到子类。父类的 class_base_init 应当 <em>撤销</em> 这些不应被继承的副作用。
+  大多数类型不需要 class_base_init —— 它是为少数需要感知 "被继承" 事件的类型设计的。
+</div>
+
+<h2>3.3 instance_init —— 实例的诞生</h2>
+
+<pre><code><span class="cm">/* qom/object.c:421 */</span>
+<span class="kw">static void</span> object_init_with_type(Object *obj, TypeImpl *ti)
+{
+    <span class="kw">if</span> (type_has_parent(ti)) {
+        object_init_with_type(obj, type_get_parent(ti));  <span class="cm">/* ★ 先递归初始化父类型 */</span>
+    }
+    <span class="kw">if</span> (ti->instance_init) {
+        ti->instance_init(obj);      <span class="cm">/* 调用该层的 instance_init */</span>
+    }
+}</code></pre>
+
+<p>
+调用顺序：<strong>从根类型到最具体的类型</strong>（类似 C++ 的 constructor 链）。
+</p>
+
+<div class="ascii-box">
+TYPE_OBJECT    → object_instance_init(obj)
+TYPE_DEVICE    → device_instance_init(obj)
+TYPE_PCI_DEVICE → pci_device_instance_init(obj)
+TYPE_E1000     → e1000_instance_init(obj)
+</div>
+
+<p>
+每个 <code>instance_init</code> 只初始化 <strong>自己那一层</strong> 的字段，
+不对子类字段做任何假设。
+</p>
+
+<p>完整的对象构造流程：</p>
+
+<pre><code><span class="cm">/* qom/object.c:496 */</span>
+<span class="kw">static void</span> object_initialize_with_type(Object *obj, <span class="ty">size_t</span> size, TypeImpl *type)
+{
+    type_initialize(type);            <span class="cm">/* [1] 确保 class 已初始化 */</span>
+
+    g_assert(type->instance_size >= <span class="kw">sizeof</span>(Object));
+    g_assert(type->abstract == <span class="kw">false</span>);
+    g_assert(size >= type->instance_size);
+
+    memset(obj, 0, type->instance_size);  <span class="cm">/* [2] 清零整个实例内存 */</span>
+    obj->class = type->class;             <span class="cm">/* [3] 设置 class 指针 */</span>
+    object_ref(obj);                      <span class="cm">/* [4] ref = 1 */</span>
+    object_class_property_init_all(obj);  <span class="cm">/* [5] 初始化 static properties */</span>
+    obj->properties = g_hash_table_new_full(...);
+    object_init_with_type(obj, type);     <span class="cm">/* [6] instance_init 链 */</span>
+    object_post_init_with_type(obj, type);<span class="cm">/* [7] instance_post_init 链 */</span>
+}</code></pre>
+
+<h2>3.4 设备的两阶段构造：init + realize</h2>
+
+<p>
+普通 QOM 对象在 <code>object_initialize</code> 后就 "可用" 了。
+但 <strong>设备</strong> (TYPE_DEVICE 的子类型) 多一个阶段：
+</p>
+
+<div class="ascii-box lifecycle">
+Phase 1: object_initialize()       <span class="cm">/* 不可失败 */</span>
+  ├─ 分配内存
+  ├─ instance_init 链
+  └─ 设置初始字段值
+       │
+       │  ← 此时设备还不能被 guest 使用
+       ▼
+Phase 2: qdev_realize() / device_set_realized(true)  <span class="cm">/* 可以失败 */</span>
+  ├─ 检查属性完整性
+  ├─ 调用 DeviceClass::realize() 回调
+  │    ├─ 映射 MMIO 区域
+  │    ├─ 注册 IRQ
+  │    ├─ 创建子设备
+  │    └─ 失败时返回 Error
+  └─ 标记 realized = true
+</div>
+
+<div class="note">
+  <strong>为什么要分两阶段？</strong>
+  <ul>
+    <li><strong>instance_init</strong> 没有 Error** 参数 —— 不能失败。只能做简单字段赋初值、创建子对象、设置属性默认值</li>
+    <li><strong>realize</strong> 有 Error** 参数 —— 可以失败。分配硬件资源（MMIO、IRQ、定时器），这些操作可能因配置错误而失败</li>
+    <li>这种设计也支持 <strong>设备自省 (device introspection)</strong>：可以先 instance_init 一个设备，读取其属性，而不真正 realize 它</li>
+  </ul>
+</div>
+
+<h2>3.5 高层 API：object_new</h2>
+
+<pre><code><span class="cm">/* include/qom/object.h:633 */</span>
+Object *object_new(<span class="kw">const char</span> *typename)
+{
+    TypeImpl *type = type_get_or_load_by_name(typename, &amp;error_fatal);
+    <span class="kw">return</span> object_new_with_class(type->class);
+}
+
+Object *object_new_with_class(ObjectClass *klass)
+{
+    Object *obj = g_malloc(klass->type->instance_size);
+    object_initialize_with_type(obj, klass->type->instance_size, klass->type);
+    <span class="kw">return</span> obj;
+}</code></pre>
+
+<p>
+<code>object_new("virtio-net-pci")</code> → 查找类型 → 分配内存 → instance_init 链 → 返回可用对象。
+</p>
+
+<h2>3.6 析构：instance_finalize + unref</h2>
+
+<pre><code>object_unref(obj)
+  ├─ obj->ref--
+  ├─ if ref == 0:
+  │    ├─ object_property_del_all(obj)
+  │    ├─ instance_finalize 链 (从具体类型到根类型，反向)
+  │    │    e1000_finalize → pci_device_finalize → device_finalize → object_finalize
+  │    └─ g_free(obj)
+  └─ return</code></pre>
+
+<p>finalize 调用顺序与 init 相反：<strong>最具体的类型先被析构</strong>（类似 C++ 的析构函数链）。</p>
+
+<h2>本模块小结</h2>
+
+<table>
+  <tr><th>回调</th><th>调用时机</th><th>用途</th></tr>
+  <tr><td>class_init</td><td>type_initialize 的最后一步</td><td>设置虚函数指针、static 属性</td></tr>
+  <tr><td>class_base_init</td><td>子类型的 class_init 之前</td><td>撤销父类 memcpy 的副作用</td></tr>
+  <tr><td>instance_init</td><td>object_initialize 期间</td><td>初始化实例字段（不可失败）</td></tr>
+  <tr><td>instance_post_init</td><td>所有 instance_init 之后</td><td>需要子类先初始化的收尾工作</td></tr>
+  <tr><td>realize (设备)</td><td>qdev_realize / device_set_realized(true)</td><td>分配硬件资源（可失败）</td></tr>
+  <tr><td>instance_finalize</td><td>object_unref → ref==0</td><td>释放实例资源</td></tr>
+</table>
+
+<div class="footer">
+  <p><a href="02-type-registry.html">← #02 Registry</a> | <a href="index.html">Portal</a> | <a href="04-properties.html">#04 Properties →</a></p>
+  <p>Source: QEMU <code>master</code> @ <code>ac0cc20ad2</code> — 2026-07-21</p>
+</div>
+
+</body>
+</html>

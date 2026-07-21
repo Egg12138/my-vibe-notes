@@ -1,0 +1,131 @@
+/* QOM Lecture Series — Terminal Dark Theme */
+:root {
+    --bg: #1a1b26;
+    --bg-alt: #24283b;
+    --fg: #a9b1d6;
+    --fg-bright: #c0caf5;
+    --accent: #7dcfff;
+    --green: #9ece6a;
+    --yellow: #e0af68;
+    --red: #f7768e;
+    --purple: #bb9af7;
+    --comment: #565f89;
+    --border: #3b4261;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+    font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', 'Consolas', monospace;
+    background: var(--bg);
+    color: var(--fg);
+    line-height: 1.7;
+    font-size: 15px;
+    max-width: 960px;
+    margin: 0 auto;
+    padding: 2rem 1.5rem;
+}
+
+/* ── Top Nav ── */
+.top-nav {
+    display: flex; flex-wrap: wrap; gap: 0.4rem;
+    padding: 0.8rem 1rem; background: var(--bg-alt);
+    border: 1px solid var(--border); border-radius: 8px;
+    margin-bottom: 1.5rem; align-items: center;
+}
+.top-nav a { color: var(--accent); text-decoration: none; font-size: 0.85rem; }
+.top-nav a:hover { color: var(--fg-bright); text-decoration: underline; }
+.top-nav .sep { color: var(--comment); }
+.top-nav .current { color: var(--green); font-weight: bold; }
+
+/* ── Tab bar ── */
+.tab-bar {
+    display: flex; gap: 0; margin-bottom: 1.5rem;
+    border-bottom: 2px solid var(--border);
+}
+.tab-bar a {
+    padding: 0.5rem 1.2rem; color: var(--comment); text-decoration: none;
+    border-bottom: 2px solid transparent; margin-bottom: -2px;
+    font-size: 0.9rem;
+}
+.tab-bar a:hover { color: var(--fg-bright); }
+.tab-bar a.active { color: var(--accent); border-bottom-color: var(--accent); }
+
+/* ── Headings ── */
+h1 { color: var(--fg-bright); font-size: 1.6rem; margin: 1.5rem 0 1rem; }
+h2 { color: var(--accent); font-size: 1.25rem; margin: 1.4rem 0 0.7rem; border-bottom: 1px solid var(--border); padding-bottom: 0.3rem; }
+h3 { color: var(--purple); font-size: 1.05rem; margin: 1.2rem 0 0.5rem; }
+h4 { color: var(--yellow); font-size: 0.95rem; margin: 1rem 0 0.4rem; }
+
+p { margin: 0.6rem 0; }
+
+/* ── Code ── */
+code { color: var(--green); background: var(--bg-alt); padding: 0.15em 0.4em; border-radius: 3px; font-size: 0.88em; }
+pre { background: var(--bg-alt); border: 1px solid var(--border); border-radius: 6px; padding: 1rem 1.2rem; overflow-x: auto; margin: 0.8rem 0; line-height: 1.5; }
+pre code { background: none; padding: 0; color: var(--fg); }
+pre .kw { color: var(--purple); }  /* keyword */
+pre .ty { color: var(--accent); }  /* type */
+pre .str { color: var(--green); }  /* string */
+pre .cm { color: var(--comment); } /* comment */
+pre .ma { color: var(--yellow); }  /* macro */
+pre .fn { color: var(--accent); }  /* function */
+
+/* ── ASCII diagrams ── */
+.ascii-box {
+    background: var(--bg-alt); border: 1px solid var(--border);
+    padding: 1rem 1.2rem; border-radius: 4px;
+    font-family: 'JetBrains Mono', 'Fira Code', monospace;
+    font-size: 0.82rem; line-height: 1.35; color: var(--accent);
+    white-space: pre; overflow-x: auto; margin: 0.8rem 0;
+}
+.ascii-box.type-hierarchy { color: var(--green); }
+.ascii-box.lifecycle { color: var(--yellow); }
+
+/* ── Info / warning boxes ── */
+.note {
+    background: #1e2a3a; border-left: 3px solid var(--accent);
+    padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 0 4px 4px 0;
+    font-size: 0.9rem;
+}
+.warn {
+    background: #2a221e; border-left: 3px solid var(--yellow);
+    padding: 0.7rem 1rem; margin: 1rem 0; border-radius: 0 4px 4px 0;
+    font-size: 0.9rem;
+}
+
+/* ── Tables ── */
+table { width: 100%; border-collapse: collapse; margin: 1rem 0; }
+th, td { text-align: left; padding: 0.45rem 0.7rem; border: 1px solid var(--border); font-size: 0.88rem; }
+th { background: var(--bg-alt); color: var(--accent); }
+td code { font-size: 0.82rem; }
+
+/* ── Links ── */
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; color: var(--fg-bright); }
+
+/* ── Lists ── */
+ul, ol { margin: 0.4rem 0 0.4rem 1.5rem; }
+li { margin: 0.2rem 0; }
+
+/* ── Footer ── */
+.footer {
+    margin-top: 3rem; padding-top: 0.8rem; border-top: 1px solid var(--border);
+    font-size: 0.78rem; color: var(--comment);
+}
+
+/* ── Module card on portal ── */
+.module-card {
+    background: var(--bg-alt); border: 1px solid var(--border);
+    border-radius: 6px; padding: 1rem 1.3rem; margin: 0.8rem 0;
+    transition: border-color 0.2s;
+}
+.module-card:hover { border-color: var(--accent); }
+.module-card h3 { margin-top: 0; }
+.module-card .num { color: var(--accent); font-weight: bold; margin-right: 0.3rem; }
+.module-card .topics { color: var(--comment); font-size: 0.85rem; margin-top: 0.3rem; }
+
+/* ── Print ── */
+@media print {
+    body { background: white; color: black; }
+    pre, .ascii-box, .note, .warn { background: #f5f5f5; border-color: #ccc; }
+}

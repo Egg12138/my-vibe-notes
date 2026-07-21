@@ -1,0 +1,317 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>#07 实战：新增自定义 QOM 类型 — QEMU QOM 教学</title>
+<link rel="stylesheet" href="css/style.css">
+</head>
+<body>
+
+<div class="top-nav">
+  <a href="index.html">Portal</a>
+  <span class="sep">|</span>
+  <a href="01-motivation.html">#01</a> <span class="sep">|</span>
+  <a href="02-type-registry.html">#02</a> <span class="sep">|</span>
+  <a href="03-lifecycle.html">#03</a> <span class="sep">|</span>
+  <a href="04-properties.html">#04</a> <span class="sep">|</span>
+  <a href="05-inheritance.html">#05</a> <span class="sep">|</span>
+  <a href="06-type-landscape.html">#06</a> <span class="sep">|</span>
+  <span class="current">#07 Capstone</span>
+</div>
+
+<h1>#07 实战：新增自定义 QOM 类型</h1>
+
+<p>
+本讲将所有前序知识串联成一个 <strong>完整可编译的自定义 QOM 类型</strong>。
+我们会实现一个简单的 "hello-device"：一个 SysBus 设备，有两个属性（message 和 repeat），
+每次 MMIO 读取返回不同内容。
+</p>
+
+<h2>7.1 Header: 声明类型</h2>
+
+<pre><code><span class="cm">/* include/hw/misc/hello.h */</span>
+<span class="ma">#ifndef HELLO_H</span>
+<span class="ma">#define HELLO_H</span>
+
+<span class="ma">#include "hw/sysbus.h"</span>
+<span class="ma">#include "qom/object.h"</span>
+
+<span class="ma">#define TYPE_HELLO_DEVICE "hello-device"</span>
+
+<span class="cm">/* 步骤 1: 用 OBJECT_DECLARE_TYPE 声明类型, 自动生成 cast helpers */</span>
+OBJECT_DECLARE_TYPE(HelloDeviceState, HelloDeviceClass, HELLO_DEVICE)
+
+<span class="cm">/* 步骤 2: 定义 Instance struct —— 首字段必须是父类实例 */</span>
+<span class="kw">struct</span> <span class="ty">HelloDeviceState</span> {
+    SysBusDevice parent_obj;   <span class="cm">/* ★ 必须是第一个字段 */</span>
+
+    <span class="cm">/* 我们的自定义字段 */</span>
+    MemoryRegion mmio;
+    <span class="kw">char</span> *message;             <span class="cm">/* 属性: "message" */</span>
+    uint32_t repeat;           <span class="cm">/* 属性: "repeat" */</span>
+    uint32_t count;            <span class="cm">/* 内部状态: MMIO 读取次数 */</span>
+};
+
+<span class="cm">/* 步骤 3: 定义 Class struct —— 首字段必须是父类 class */</span>
+<span class="kw">struct</span> <span class="ty">HelloDeviceClass</span> {
+    SysBusDeviceClass parent_class;  <span class="cm">/* ★ 必须是第一个字段 */</span>
+
+    <span class="cm">/* 如果有虚函数, 在这里声明。简单设备通常不需要 */</span>
+};
+
+<span class="ma">#endif /* HELLO_H */</span></code></pre>
+
+<div class="note">
+  <strong>OBJECT_DECLARE_TYPE(HelloDeviceState, HelloDeviceClass, HELLO_DEVICE) 生成了什么？</strong>
+  <ul>
+    <li><code>HELLO_DEVICE(obj)</code> → 安全的 Object* → HelloDeviceState* 转换</li>
+    <li><code>HELLO_DEVICE_GET_CLASS(obj)</code> → 获取 HelloDeviceClass</li>
+    <li><code>HELLO_DEVICE_CLASS(klass)</code> → 安全的 ObjectClass* → HelloDeviceClass* 转换</li>
+    <li><code>g_autoptr(HelloDeviceState)</code> → 自动引用计数释放</li>
+  </ul>
+</div>
+
+<h2>7.2 Source: 实现类型</h2>
+
+<pre><code><span class="cm">/* hw/misc/hello.c */</span>
+<span class="ma">#include "qemu/osdep.h"</span>
+<span class="ma">#include "hw/misc/hello.h"</span>
+<span class="ma">#include "qemu/log.h"</span>
+
+<span class="cm">/* ── MMIO 回调 ── */</span>
+<span class="kw">static</span> uint64_t hello_mmio_read(<span class="kw">void</span> *opaque, hwaddr addr, <span class="kw">unsigned</span> size)
+{
+    HelloDeviceState *s = HELLO_DEVICE(opaque);
+    <span class="kw">const char</span> *msg = s->message ? s->message : <span class="str">"Hello from QOM!"</span>;
+
+    s->count++;
+    <span class="kw">return</span> (uint64_t)msg[(s->count / s->repeat) % strlen(msg)];
+}
+
+<span class="kw">static const</span> MemoryRegionOps hello_mmio_ops = {
+    .read = hello_mmio_read,
+    .endianness = DEVICE_NATIVE_ENDIAN,
+};
+
+<span class="cm">/* ── 属性 getter/setter ── */</span>
+<span class="kw">static void</span> hello_get_message(Object *obj, Visitor *v, <span class="kw">const char</span> *name,
+                                <span class="kw">void</span> *opaque, Error **errp)
+{
+    HelloDeviceState *s = HELLO_DEVICE(obj);
+    visit_type_str(v, name, &amp;s->message, errp);
+}
+
+<span class="kw">static void</span> hello_set_message(Object *obj, Visitor *v, <span class="kw">const char</span> *name,
+                                <span class="kw">void</span> *opaque, Error **errp)
+{
+    HelloDeviceState *s = HELLO_DEVICE(obj);
+    <span class="kw">char</span> *value = NULL;
+
+    <span class="kw">if</span> (!visit_type_str(v, name, &amp;value, errp)) {
+        <span class="kw">return</span>;
+    }
+    g_free(s->message);
+    s->message = value;
+}
+
+<span class="kw">static void</span> hello_get_repeat(Object *obj, Visitor *v, <span class="kw">const char</span> *name,
+                               <span class="kw">void</span> *opaque, Error **errp)
+{
+    HelloDeviceState *s = HELLO_DEVICE(obj);
+    visit_type_uint32(v, name, &amp;s->repeat, errp);
+}
+
+<span class="kw">static void</span> hello_set_repeat(Object *obj, Visitor *v, <span class="kw">const char</span> *name,
+                               <span class="kw">void</span> *opaque, Error **errp)
+{
+    HelloDeviceState *s = HELLO_DEVICE(obj);
+    uint32_t value;
+    <span class="kw">if</span> (!visit_type_uint32(v, name, &amp;value, errp)) {
+        <span class="kw">return</span>;
+    }
+    <span class="kw">if</span> (value == 0) {
+        error_setg(errp, <span class="str">"repeat must be > 0"</span>);  <span class="cm">/* setter 可以实现验证 */</span>
+        <span class="kw">return</span>;
+    }
+    s->repeat = value;
+}
+
+<span class="cm">/* ── instance_init: 不可失败, 只做简单的初始化 ── */</span>
+<span class="kw">static void</span> hello_device_init(Object *obj)
+{
+    HelloDeviceState *s = HELLO_DEVICE(obj);
+
+    s->message = g_strdup(<span class="str">"Hello from QOM!"</span>);
+    s->repeat = 1;
+    s->count = 0;
+
+    <span class="cm">/* 注册属性 */</span>
+    object_property_add(obj, <span class="str">"message"</span>, <span class="str">"str"</span>,
+                        hello_get_message, hello_set_message, NULL, s);
+    object_property_add(obj, <span class="str">"repeat"</span>, <span class="str">"uint32"</span>,
+                        hello_get_repeat, hello_set_repeat, NULL, s);
+}
+
+<span class="cm">/* ── realize: 可失败, 分配硬件资源 ── */</span>
+<span class="kw">static void</span> hello_device_realize(DeviceState *dev, Error **errp)
+{
+    HelloDeviceState *s = HELLO_DEVICE(dev);
+
+    <span class="cm">/* 注册 MMIO 区域 —— 这是真的硬件资源, 可以失败 */</span>
+    memory_region_init_io(&amp;s->mmio, OBJECT(dev), &amp;hello_mmio_ops, s,
+                          <span class="str">"hello-mmio"</span>, 0x1000);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &amp;s->mmio);
+}
+
+<span class="cm">/* ── finalize: 释放资源 ── */</span>
+<span class="kw">static void</span> hello_device_finalize(Object *obj)
+{
+    HelloDeviceState *s = HELLO_DEVICE(obj);
+    g_free(s->message);
+}
+
+<span class="cm">/* ── class_init: 设置虚函数指针 ── */</span>
+<span class="kw">static void</span> hello_device_class_init(ObjectClass *oc, <span class="kw">void</span> *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(oc);
+    dc->realize = hello_device_realize;   <span class="cm">/* 覆盖 realize 虚函数 */</span>
+    dc->desc = <span class="str">"Hello QOM Device"</span>;
+    dc->user_creatable = <span class="kw">true</span>;           <span class="cm">/* 允许 device_add */</span>
+}
+
+<span class="cm">/* ── ★ 核心: 这个宏生成 TypeInfo + 注册函数 + type_init ── */</span>
+OBJECT_DEFINE_TYPE(HelloDeviceState, hello_device, HELLO_DEVICE, SYS_BUS_DEVICE)</code></pre>
+
+<h2>7.3 OBJECT_DEFINE_TYPE 展开全景</h2>
+
+<p>
+<code>OBJECT_DEFINE_TYPE(HelloDeviceState, hello_device, HELLO_DEVICE, SYS_BUS_DEVICE)</code>
+展开后的效果：
+</p>
+
+<pre><code><span class="cm">/* 等同于: OBJECT_DEFINE_TYPE_EXTENDED(HelloDeviceState, hello_device,
+                                       HELLO_DEVICE, SYS_BUS_DEVICE,
+                                       false, sizeof(HelloDeviceClass), ) */</span>
+
+<span class="kw">static void</span> hello_device_finalize(Object *obj);              <span class="cm">/* 声明 */</span>
+<span class="kw">static void</span> hello_device_class_init(ObjectClass *oc, <span class="kw">const void</span> *data);
+<span class="kw">static void</span> hello_device_init(Object *obj);
+
+<span class="kw">static const</span> TypeInfo hello_device_info = {
+    .parent           = TYPE_SYS_BUS_DEVICE,       <span class="cm">/* ← 继承自 SysBusDevice */</span>
+    .name             = <span class="str">"hello-device"</span>,
+    .instance_size    = <span class="kw">sizeof</span>(HelloDeviceState),
+    .instance_align   = __alignof__(HelloDeviceState),
+    .instance_init    = hello_device_init,
+    .instance_finalize = hello_device_finalize,
+    .class_size       = <span class="kw">sizeof</span>(HelloDeviceClass),
+    .class_init       = hello_device_class_init,
+    .abstract         = <span class="kw">false</span>,                   <span class="cm">/* 可实例化 */</span>
+};
+
+<span class="kw">static void</span> hello_device_register_types(<span class="kw">void</span>)
+{
+    type_register_static(&amp;hello_device_info);
+}
+type_init(hello_device_register_types);             <span class="cm">/* ★ 构造时注册 */</span></code></pre>
+
+<div class="warn">
+  <strong>关键点:</strong> 开发者只需提供三个函数 (<code>_init</code>, <code>_class_init</code>, <code>_finalize</code>)
+  和一个 struct (<code>HelloDeviceState</code>)。其余全部由宏自动生成。这就是 QOM 的编程范式。
+</div>
+
+<h2>7.4 构建集成</h2>
+
+<p>将新设备加入 QEMU 构建系统 (meson.build):</p>
+
+<pre><code><span class="cm">/* hw/misc/meson.build */</span>
+system_ss.add(when: <span class="str">'CONFIG_HELLO_DEVICE'</span>, if_true: files(<span class="str">'hello.c'</span>))
+
+<span class="cm">/* 或者简单加 (无条件编译): */</span>
+system_ss.add(files(<span class="str">'hello.c'</span>))</code></pre>
+
+<h2>7.5 运行时交互</h2>
+
+<p>启动 QEMU 并验证我们的设备：</p>
+
+<pre><code><span class="cm"># 启动 QEMU, 添加 hello-device</span>
+$ qemu-system-x86_64 -M pc -device hello-device,id=h1,message=<span class="str">"QOM rocks!"</span>,repeat=3
+
+<span class="cm"># 在 QMP monitor 中自省</span>
+(qemu) info qom-tree
+/machine/peripheral/h1 (hello-device)
+  /message = "QOM rocks!"
+  /repeat = 3
+
+(qemu) qom-get /machine/peripheral/h1 message
+<span class="str">"QOM rocks!"</span>
+
+(qemu) qom-set /machine/peripheral/h1 message <span class="str">"Learning QOM"</span>
+(qemu) qom-get /machine/peripheral/h1 message
+<span class="str">"Learning QOM"</span>
+
+(qemu) object_add hello-device,id=h2,message=<span class="str">"Dynamic!"</span>,repeat=1
+<span class="cm"># 第二个设备被动态创建！</span></code></pre>
+
+<h2>7.6 QOM 编程范式总结</h2>
+
+<div class="ascii-box type-hierarchy">
+╔═══════════════════════════════════════════════════════════════╗
+║              QOM 类型开发范式 (完整流程)                       ║
+╠═══════════════════════════════════════════════════════════════╣
+║                                                               ║
+║  Header (hello.h):                                            ║
+║    1. #define TYPE_HELLO_DEVICE "hello-device"               ║
+║    2. OBJECT_DECLARE_TYPE(HelloDeviceState,                  ║
+║                           HelloDeviceClass, HELLO_DEVICE)    ║
+║    3. struct HelloDeviceState { ParentType parent; ... };    ║
+║    4. struct HelloDeviceClass { ParentClass parent; ... };   ║
+║                                                               ║
+║  Source (hello.c):                                            ║
+║    5. instance_init(Object *obj)    ← 简单初始化, 不可失败    ║
+║    6. class_init(ObjectClass *oc, data) ← 设虚函数, 设属性    ║
+║    7. realize(DeviceState *dev, Error **) ← 分配HW资源     ║
+║    8. finalize(Object *obj)         ← 释放资源              ║
+║    9. OBJECT_DEFINE_TYPE(HelloDeviceState, hello_device,     ║
+║                          HELLO_DEVICE, SYS_BUS_DEVICE)       ║
+║                                                               ║
+║  构建 (meson.build):                                          ║
+║   10. system_ss.add(files('hello.c'))                        ║
+║                                                               ║
+╚═══════════════════════════════════════════════════════════════╝
+</div>
+
+<h2>7.7 调试与排查</h2>
+
+<p>常见问题与定位方法：</p>
+
+<table>
+  <tr><th>症状</th><th>原因</th><th>排查</th></tr>
+  <tr><td>"unknown type 'hello-device'"</td><td>类型未注册</td><td>检查 type_init 是否正确展开，module 是否加载</td></tr>
+  <tr><td>SIGSEGV in instance_init</td><td>instance struct 首字段不是 parent</td><td>确认第一个字段是 <code>SysBusDevice parent_obj</code></td></tr>
+  <tr><td>属性设置失败</td><td>属性类型不匹配</td><td>用 <code>qom-list</code> 检查属性类型字符串</td></tr>
+  <tr><td>realize 未被调用</td><td>设备抽象 (abstract=true)</td><td>检查 OBJECT_DEFINE_TYPE 中 abstract 参数</td></tr>
+  <tr><td>device_add 不工作</td><td>user_creatable 未设置</td><td>在 class_init 中设置 <code>dc->user_creatable = true</code></td></tr>
+</table>
+
+<h2>本模块小结</h2>
+
+<table>
+  <tr><th>步骤</th><th>做什么</th><th>用到的宏/函数</th></tr>
+  <tr><td>1. Header</td><td>声明类型名、Instance/Class structs</td><td><code>OBJECT_DECLARE_TYPE</code></td></tr>
+  <tr><td>2. instance_init</td><td>初始化字段默认值、注册属性</td><td><code>object_property_add</code></td></tr>
+  <tr><td>3. class_init</td><td>设置虚函数指针、static 属性</td><td><code>dc->realize = ...</code></td></tr>
+  <tr><td>4. realize</td><td>分配硬件资源 (MMIO, IRQ, ...)</td><td><code>memory_region_init_io</code></td></tr>
+  <tr><td>5. 注册宏</td><td>生成 TypeInfo + type_init</td><td><code>OBJECT_DEFINE_TYPE</code></td></tr>
+  <tr><td>6. 构建</td><td>加入编译系统</td><td><code>meson.build</code></td></tr>
+  <tr><td>7. 验证</td><td>运行时自省</td><td><code>info qom-tree</code>, <code>qom-get/set</code></td></tr>
+</table>
+
+<div class="footer">
+  <p><a href="06-type-landscape.html">← #06 Landscape</a> | <a href="index.html">Portal</a></p>
+  <p>Source: QEMU <code>master</code> @ <code>ac0cc20ad2</code> — 2026-07-21</p>
+</div>
+
+</body>
+</html>
