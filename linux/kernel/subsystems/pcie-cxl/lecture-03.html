@@ -26,7 +26,10 @@
 <div class="lecture-layout">
 <aside class="sidebar">
     <h3>本讲内容</h3>
-    <a href="#principle" class="toc-item">原理</a>
+    <a href="#link" class="toc-item">链路与 Lane</a>
+    <a href="#layers" class="toc-item">分层与 TLP</a>
+    <a href="#routing" class="toc-item">路由与枚举</a>
+    <a href="#topology" class="toc-item">拓扑与总线号</a>
     <a href="#guide" class="toc-item">实验指导</a>
     <div class="exp-list">
         <h3>全部实验</h3>
@@ -49,8 +52,45 @@
 <section id="principle">
 <h2>原理</h2>
 
-<h3>PCIe 拓扑 vs 传统 PCI 拓扑</h3>
+<h3 id="link">从共享总线变成独立链路</h3>
 <p>传统 PCI 是共享总线：所有设备挂在同一条总线上，通过电气信号仲裁访问。PCIe 是<strong>点对点</strong>链路：每个设备通过独立的链路连接到上游。这意味着 PCIe 拓扑本质上是一棵<strong>树</strong>。</p>
+
+<p>一条 PCIe <strong>Lane</strong> 不是共享的一根线：<strong>每条 Lane 都由一对发送差分线和一对接收差分线组成</strong>。因此链路可以<strong>全双工</strong>工作，主机向设备的请求与设备向主机的完成包可以同时传输。x1、x4、x8、x16 表示把多少条 Lane 并联成一条 Link；实际链路宽度和代际会在上电时由两端协商。</p>
+
+<div class="ascii-diagram">
+     PCIe x4 Link：每个方向都有独立的 4 条 Lane
+
+     Root Port  TX  ========&gt;  Endpoint RX   请求、写入
+     Root Port  RX  &lt;========  Endpoint TX   完成包、中断消息
+
+     一条 Link 只连接两个相邻组件；Switch 或 Root Port 决定下一跳。
+</div>
+
+<p>链路上电后，两端先进行 <strong>Link Training</strong>：发现对端、协商可用的宽度和速率、建立可靠传输状态。Linux 的 <code>lspci -vv</code> 在真实硬件上可显示 LnkCap/LnkSta；本实验主要观察训练完成后留下的拓扑结果，而不是测量链路电气信号。</p>
+
+<h3 id="layers">分层：软件请求怎样变成在线路上传输的包</h3>
+<p>PCIe 不把一次读写表示成总线上的共享电平，而是把请求封装后逐跳发送。最常用的心智模型是三层：</p>
+<table>
+    <thead><tr><th>层</th><th>负责什么</th><th>本讲对应的现象</th></tr></thead>
+    <tbody>
+        <tr><td><strong>Transaction Layer</strong></td><td>产生和解释 TLP：配置读写、MMIO 读写、完成包、消息。</td><td>Linux 读取 Vendor ID 就是一笔配置请求。</td></tr>
+        <tr><td><strong>Data Link Layer</strong></td><td>让相邻两端可靠交付：序号、LCRC、确认与重放；控制信息使用 DLLP。</td><td>可靠性在每一跳处理，端点不需要直接面对整棵树。</td></tr>
+        <tr><td><strong>Physical Layer</strong></td><td>链路训练、编码、串并转换与差分信号传输。</td><td>把 TLP 分散到协商成功的 Lane 上。</td></tr>
+    </tbody>
+</table>
+
+<p><strong>TLP (Transaction Layer Packet)</strong> 是软件最应该关心的传输单位。它带有请求类型、地址或 BDF、长度和必要的属性；读请求不会立即携带数据，而由目标稍后返回 Completion TLP。这里的“包”是 PCIe 与传统 PCI 广播式总线模型最重要的差异之一。</p>
+
+<h3 id="routing">路由：树中的包为什么能到正确设备</h3>
+<p>每条 PCIe Link 只看得到相邻两端，但 Root Port 与 Switch 的端口保存转发表或桥窗口，因而能把 TLP 转发到正确的下游。MMIO 请求按地址路由；<strong>配置事务</strong>则按 <strong>BDF</strong>（Bus:Device.Function）定位目标 function。BDF 是 Linux 中 <code>0000:01:00.0</code> 这种地址的后三段：domain:bus:device.function。</p>
+
+<p>枚举时，Linux 从 bus 00 开始发送 <strong>Configuration Read</strong>，读取每个可能 function 的 Vendor ID。值不是 <code>0xffff</code>，说明那里有设备；若读到的是 Type 1 bridge，PCI 核心就根据桥的 primary/secondary/subordinate bus 范围扫描下游总线。Root Port 因而同时是物理链路的端点、TLP 的转发点，以及 Linux 看到的 Type 1 桥。</p>
+
+<div class="callout callout-info">
+    <strong>不要混淆两种“地址”：</strong>BDF 用来找配置空间中的一个 function；BAR 分配的 MMIO 地址用来访问该 function 暴露的寄存器。前者让 Linux 发现和配置设备，后者让驱动运行设备。
+</div>
+
+<h3 id="topology">PCIe 拓扑 vs 传统 PCI 拓扑</h3>
 
 <p>树的节点类型：</p>
 <ul>
@@ -90,6 +130,17 @@
                         └──Root Port──┘└──Endpoint──┘</code></pre>
 
 <p>路径的嵌套关系直接反映了 PCIe 的物理拓扑层级。</p>
+
+<h3>本讲原理会在后续哪里出现</h3>
+<table>
+    <thead><tr><th>这里的概念</th><th>后续实验中的可观察对象</th></tr></thead>
+    <tbody>
+        <tr><td>Configuration Read、BDF、Type 0/Type 1</td><td><strong>实验 04</strong>：从配置空间头部读出 ID、header type 和总线号。</td></tr>
+        <tr><td>按地址路由的 Memory Request TLP</td><td><strong>实验 05</strong>：BAR、桥窗口与 <code>/proc/iomem</code>。</td></tr>
+        <tr><td>Message TLP 与配置空间 capability</td><td><strong>实验 07</strong>：MSI/MSI-X 中断与能力链表。</td></tr>
+        <tr><td>复用 PCIe Link、枚举和配置空间</td><td><strong>实验 09</strong>：CXL.io 之上再增加 CXL.mem。</td></tr>
+    </tbody>
+</table>
 </section>
 
 <section id="guide">

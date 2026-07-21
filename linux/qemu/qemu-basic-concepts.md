@@ -1,8 +1,20 @@
 # QOM
 
-TODO
 
-关键宏：
+## overview
+
+在 QOM 中，幾乎所有的可見對象都是 QOM 類型的。QOM 現在就是 QOM 的骨架。
+
+QOM 初始化是一部分；
+QOM 的properties也是核心，属性系统是 QOM 的 "魔法"——它让你能在运行时自省和修改对象， 是 QMP monitor 中 qom-list/qom-get/qom-set 的底层机制， 也是 -device pci-device,property=value 命令行参数的工作方式。
+
+## 关键宏：
+
+1. 先 `DECLARE_TYPE`
+2. 再 `DEFINE_TYPE`
+### OBJECT_DECLARE_TYPE
+
+手动写 (DeviceState *)obj 是不安全的:
 
 ```c
 /**
@@ -33,7 +45,7 @@ TODO
 
 * `typedef struct #InstanceType #InstanceType`
 * `typedef struct #ClassType #ClassType`
-* `object checkers`
+* `object checkers`  --> `object_dynamic_cast_assert(object, name, ...)` 运行时类型检查
 * `g_autoptr_cleanup_func: object_unref`
 
 其中
@@ -81,7 +93,577 @@ void object_unref(void *objptr)
   G_GNUC_END_IGNORE_DEPRECATIONS
 ```
 
+以 OBJECT_DECLARE_TYPE(DeviceState, DeviceClass, DEVICE) 为例，展开后生成：
 
+```c
+
+/* 1. typedefs */
+typedef struct DeviceState DeviceState; // instance type
+typedef struct DeviceClass DeviceClass; // class type
+
+/* 2. g_autoptr 支持 —— 离开作用域自动 object_unref */
+G_DEFINE_AUTOPTR_CLEANUP_FUNC(DeviceState, object_unref)
+
+/* 3. 类型安全转换函数 */
+
+/* Instance checker: Object* → DeviceState* */
+static inline DeviceState *DEVICE(const void *obj) {
+    return OBJECT_CHECK(DeviceState, obj, TYPE_DEVICE);
+}
+
+/* Class getter: Object* → DeviceClass* */
+static inline DeviceClass *DEVICE_GET_CLASS(const void *obj) {
+    return OBJECT_GET_CLASS(DeviceClass, obj, TYPE_DEVICE);
+}
+
+/* Class checker: ObjectClass* → DeviceClass* */
+static inline DeviceClass *DEVICE_CLASS(const void *klass) {
+    return OBJECT_CLASS_CHECK(DeviceClass, klass, TYPE_DEVICE);
+}
+
+// 使用时
+void do_something(Object *obj) {
+    DeviceState *dev = DEVICE(obj);
+    DeviceClass *klass = DEVICE_GET_CLASS(obj);
+}
+
+static Object *object_dynamic_cast_assert(Object *obj, const char *typename,
+                                          const char *file, int line,
+                                          const char *func)
+{
+    Object *inst;
+    for (int i = 0; obj && i < OBJECT_CLASS_CAST_CACHE; i++) {
+        if (obj->class->object_cast_cache[i] == typename) {
+            goto out;  /* cache hit —— 绝大多数情况 */
+        }
+    }
+
+    /* cache miss: 遍历 type hierarchy */
+    inst = object_dynamic_cast(obj, typename);
+    //...
+}
+```
+
+object_dynamic_cast 的实质：
+
+```c
+Object *object_dynamic_cast(Object *obj, const char *typename)
+{
+    TypeImpl *target_type = type_get_by_name_noload(typename);
+    TypeImpl *obj_type = obj->class->type;
+
+    if (type_is_ancestor(obj_type, target_type)) {
+        return obj;
+    }
+
+    /* interface check: 遍历 obj_type 的所有接口，看是否匹配 target_type */
+    for (int i = 0; i < obj_type->num_interfaces; i++) {
+        ...
+    }
+
+    return NULL;
+}
+```
+
+### OBJECT_DEFINE_TYPE
+
+以 TYPE_OBJECT → TYPE_DEVICE 为例：
+
+```c
+/* hw/core/qdev.c — 简化示意 */
+
+/* OBJECT_DEFINE_TYPE(DeviceState, device, DEVICE, OBJECT) 展开为: */
+// OBJECT_DEFINE_TYPE(QemuTextConsole, qemu_text_console, QEMU_TEXT_CONSOLE, QEMU_CONSOLE)
+// 这里QEMU_TEXT_CONSOLE， 和QEMU_CONSOLE都已经 是 DECLARED OBJECT TYPES了
+
+
+static void device_finalize(Object *obj);
+static void device_class_init(ObjectClass *oc, const void *data);
+static void device_init(Object *obj);
+
+static const TypeInfo device_info = {
+    .parent          = TYPE_OBJECT,          /* ← 继承声明 */
+    .name            = "device",
+    .instance_size   = sizeof(DeviceState),
+    .instance_align  = __alignof__(DeviceState),
+    .instance_init   = device_init,
+    .instance_finalize = device_finalize,
+    .class_size      = sizeof(DeviceClass),
+    .class_size      = sizeof(DeviceClass),
+    .class_init      = device_class_init,
+    .abstract        = true,               /* TYPE_DEVICE 是抽象的 */
+};
+
+static void device_register_types(void)
+{
+    type_register_static(&device_info);
+}
+type_init(device_register_types);         /* ★ 构造时注册 */
+
+/* 然后开发者实现三个函数: */
+static void device_init(Object *obj)       { /* 实例初始化 */ }
+static void device_class_init(ObjectClass *oc, const void *data) {
+    /* 设置虚函数指针, 注册属性 */
+}
+static void device_finalize(Object *obj)   { /* 清理 */ }
+```
+
+完整 QOM 编程范式的三个步骤：
+1. Header: 定义 Instance struct (首字段: ParentInstance)、Class struct (首字段: ParentClass)，调用 OBJECT_DECLARE_TYPE
+2. Source: 调用 OBJECT_DEFINE_TYPE 宏，实现 _init/_class_init/_finalize
+3. Registration: type_init 宏自动在 QOM 初始化阶段调用 type_register_static
+
+
+
+```
+type_initialize(ti)              /* qom/object.c:336 */
+  │
+  ├─ [1] ti->class_size = type_class_get_size(ti)
+  │      /* 如果 class_size==0, 递归取父类的 class_size */
+  │
+  ├─ [2] ti->instance_size = type_object_get_size(ti)
+  │      /* 如果 instance_size==0 → 标记为 abstract */
+  │
+  ├─ [3] ti->class = g_malloc0(ti->class_size)
+  │      /* 分配 Class 内存 */
+  │
+  ├─ [4] type_initialize(parent)      /* 递归初始化父类型 */
+  │
+  ├─ [5] memcpy(ti->class, parent->class, parent->class_size)
+  │      /* ★ 核心：从父类 memcpy 整个 vtable！ */
+  │      /* 这样父类的虚函数指针被子类自动继承 */
+  │
+  ├─ [6] 处理 interfaces
+  │      ├─ 拷贝父类的 interface 实现
+  │      └─ type_initialize_interface() 初始化自己的接口
+  │
+  ├─ [7] ti->class->properties = g_hash_table_new(...)
+  │
+  ├─ [8] ti->class->type = ti       /* 回指 TypeImpl */
+  │
+  ├─ [9] 执行 class_base_init 链（从最远的祖先到最近）
+  │      for parent in ancestors(root → self.parent):
+  │          if parent->class_base_init:
+  │              parent->class_base_init(ti->class, ti->class_data)
+  │
+  └─ [10] ti->class_init(ti->class, ti->class_data)
+          /* 覆盖虚函数指针，定义该类的行为 */
+```
+
+步骤 [5] 的 memcpy 是 QOM 继承机制的核心：
+
+子类的 Class 内存大小 ≥ 父类的 Class 内存大小（在 step [1] 中保证）
+memcpy 把父类 Class 的 全部内容 复制到子类 Class 的起始位置
+如果父类的 class_init 设置了某个函数指针（如 realize = my_realize），子类自动继承了它
+子类的 class_init 可以做覆盖：dc->realize = my_sub_realize
+class_base_init 的陷阱： 如果父类型在 class_init 中设置了一个字段（比如分配了一个 buffer）， 这个 buffer 会被 memcpy 到子类。父类的 class_base_init 应当 撤销 这些不应被继承的副作用。 大多数类型不需要 class_base_init —— 它是为少数需要感知 "被继承" 事件的类型设计的。
+
+
+## 整个生命周期简介
+
+1. object + objectclass有了定义；
+2. class怎样初始化到虚表中的？lazily initialized: `type_initialize(ti)`
+> 这个过程主要是因为需要一点的runtime来进行拷贝等编译器无法完成的初始化过程
+3. 递归诞生实例 `instance_init`
+4. 如果这个QOM对象是一个设备,还有构造阶段`qdev_realize()`
+
+> 1-3是通用的类型系统初始化，不可以失败
+> 4是设备realize，可以失败
+
+```
+static void obejct_init_with_type(ObjectClass *obj, TypeImpl *ti)
+{
+    if (type_has_parent(ti)) object_init_wiht_type(obj, ti->parent);
+    if (ti->instance_init)   ti->instance_init(obj);
+}
+```
+
+调用顺序：从根类型到最具体的类型（类似 C++ 的 constructor 链）。
+
+```
+TYPE_OBJECT    → object_instance_init(obj)
+TYPE_DEVICE    → device_instance_init(obj)
+TYPE_PCI_DEVICE → pci_device_instance_init(obj)
+TYPE_E1000     → e1000_instance_init(obj)
+```
+每个 instance_init 只初始化 自己那一层 的字段， 不对子类字段做任何假设。
+
+```c
+/* qom/object.c:496 */
+static void object_initialize_with_type(Object *obj, size_t size, TypeImpl *type)
+{
+    type_initialize(type);            /* [1] 确保 class 已初始化 */
+
+    g_assert(type->instance_size >= sizeof(Object));
+    g_assert(type->abstract == false);
+    g_assert(size >= type->instance_size);
+
+    memset(obj, 0, type->instance_size);  /* [2] 清零整个实例内存 */
+    obj->class = type->class;             /* [3] 设置 class 指针 */
+    object_ref(obj);                      /* [4] ref = 1 */
+    object_class_property_init_all(obj);  /* [5] 初始化 static properties */
+    obj->properties = g_hash_table_new_full(...);
+    object_init_with_type(obj, type);     /* [6] instance_init 链 */
+    object_post_init_with_type(obj, type);/* [7] instance_post_init 链 */
+}
+```
+
+## 属性系统
+
+```c
+/* include/qom/object.h:89 */
+struct ObjectProperty
+{
+    char *name;                      /* 属性名称 */
+    char *type;                      /* 属性类型描述 (QAPI type) */
+    char *description;               /* 人类可读的描述 */
+    ObjectPropertyAccessor *get;     /* getter: (obj, visitor, name, opaque, errp) */
+    ObjectPropertyAccessor *set;     /* setter: 同上 */
+    ObjectPropertyResolve *resolve;  /* 路径解析 (用于 child<> 属性) */
+    ObjectPropertyRelease *release;  /* 属性被删除时的回调 */
+    ObjectPropertyInit *init;        /* 属性创建时的回调 */
+    void *opaque;                    /* 传递给 get/set 的不透明数据 */
+    QObject *defval;                 /* 默认值 */
+};
+```
+
+我们会发现 `ObjectPropertyAccessor`, `ObjectPropertyRelease`, `ObjectPropertyInit` 和 `ObjectPropertyResolve`
+
+```c
+typedef void (ObjectPropertyAccessor) (Object *obj, Visitor *v, const char *name, void *opaque, Error **errp);
+```
+
+那 `Visitor` 是啥？
+
+```c
+
+/*
+ * There are four classes of visitors; setting the class determines
+ * how QAPI enums are visited, as well as what additional restrictions
+ * can be asserted.  The values are intentionally chosen so as to
+ * permit some assertions based on whether a given bit is set (that
+ * is, some assertions apply to input and clone visitors, some
+ * assertions apply to output and clone visitors).
+ */
+typedef enum VisitorType {
+    VISITOR_INPUT = 1,
+    VISITOR_OUTPUT = 2,
+    VISITOR_CLONE = 3,
+    VISITOR_DEALLOC = 4,
+} VisitorType;
+
+struct Visitor
+{
+    /*
+     * Only input visitors may fail!
+     */
+
+    /* Must be set to visit structs */
+    bool (*start_struct)(Visitor *v, const char *name, void **obj,
+                         size_t size, Error **errp);
+
+    /* Optional; intended for input visitors */
+    bool (*check_struct)(Visitor *v, Error **errp);
+
+    /* Must be set to visit structs */
+    void (*end_struct)(Visitor *v, void **obj);
+
+    /* Must be set; implementations may require @list to be non-null,
+     * but must document it. */
+    bool (*start_list)(Visitor *v, const char *name, GenericList **list,
+                       size_t size, Error **errp);
+
+    /* Must be set */
+    GenericList *(*next_list)(Visitor *v, GenericList *tail, size_t size);
+
+    /* Optional; intended for input visitors */
+    bool (*check_list)(Visitor *v, Error **errp);
+
+    /* Must be set */
+    void (*end_list)(Visitor *v, void **list);
+
+    /* Must be set by input and clone visitors to visit alternates */
+    bool (*start_alternate)(Visitor *v, const char *name,
+                            GenericAlternate **obj, size_t size,
+                            Error **errp);
+
+    /* Optional */
+    void (*end_alternate)(Visitor *v, void **obj);
+
+    /* Must be set */
+    bool (*type_int64)(Visitor *v, const char *name, int64_t *obj,
+                       Error **errp);
+
+    /* Must be set */
+    bool (*type_uint64)(Visitor *v, const char *name, uint64_t *obj,
+                        Error **errp);
+
+    /* Optional; fallback is type_uint64() */
+    bool (*type_size)(Visitor *v, const char *name, uint64_t *obj,
+                      Error **errp);
+
+    /* Must be set */
+    bool (*type_bool)(Visitor *v, const char *name, bool *obj, Error **errp);
+
+    /* Must be set */
+    bool (*type_str)(Visitor *v, const char *name, char **obj, Error **errp);
+
+    /* Must be set to visit numbers */
+    bool (*type_number)(Visitor *v, const char *name, double *obj,
+                        Error **errp);
+
+    /* Must be set to visit arbitrary QTypes */
+    bool (*type_any)(Visitor *v, const char *name, QObject **obj,
+                     Error **errp);
+
+    /* Must be set to visit explicit null values.  */
+    bool (*type_null)(Visitor *v, const char *name, QNull **obj,
+                      Error **errp);
+
+    /* Must be set for input visitors to visit structs, optional otherwise.
+       The core takes care of the return type in the public interface. */
+    void (*optional)(Visitor *v, const char *name, bool *present);
+
+    /* Optional */
+    bool (*policy_reject)(Visitor *v, const char *name,
+                          uint64_t features, Error **errp);
+
+    /* Optional */
+    bool (*policy_skip)(Visitor *v, const char *name,
+                        uint64_t features);
+
+    /* Must be set */
+    VisitorType type;
+
+    /* Optional */
+    struct CompatPolicy compat_policy;
+
+    /* Must be set for output visitors, optional otherwise. */
+    void (*complete)(Visitor *v, void *opaque);
+
+    /* Must be set */
+    void (*free)(Visitor *v);
+};
+```
+
+实际上就是一套钩子, 这样建模可以方便地写不同的 getter/setter,
+
+property还可以扩充:
+
+```c
+object_property_add(obj, "qtest-clock-period", "uint64",
+                        clock_period_prop_get, NULL, NULL, NULL);
+/* 标量类型属性 */
+object_property_add_uint8_ptr(obj, "revision", &dev->revision);
+object_property_add_uint32_ptr(obj, "freq_hz", &dev->freq_hz);
+object_property_add_bool(obj, "enabled",
+                         my_get_enabled, my_set_enabled);
+
+/* Link 属性 —— 指向另一个 QOM 对象的链接 */
+object_property_add_link(obj, "dma", TYPE_DMA_ENGINE,
+                         (Object **)&dev->dma,
+                         NULL, OBJ_PROP_LINK_STRONG);
+```
+
+属性支持数组属性：
+
+```c
+if (name_len >= 3 && !memcmp(name + name_len - 3, "[*]", 4)) {
+    // 自动尝试 name[0], name[1], ... 直到找到一个空闲编号（上限 INT16_MAX）
+    char *name_no_array = g_strdup(name);
+    name_no_array[name_len - 3] = '\0';
+    for (i = 0; i < INT64_MAX; i++) {
+        char *full_name = g_strdup_printf("%s[%d]", name_no_array, i);
+        ret = obejct_property_add(obj, full_name, prop->type, get, set, release, opaque, NULL);
+        g_free(full_name); // 因为是dup的了
+        if (ret) break;
+    }
+    //...
+}
+```
+
+我们看一下数据面，属性都在哪？
+
+```c
+struct Object
+{
+    /* private: */
+    ObjectClass *class;
+    ObjectFree *free;
+    GHashTable *properties; // obj->properties
+    uint32_t ref;
+    Object *parent;
+};
+```
+
+```c
+static void object_property_free(gpointer data)
+{
+    ObjectProperty *prop = data;
+
+    if (prop->defval) {
+        qobject_unref(prop->defval);
+        prop->defval = NULL;
+    }
+    g_free(prop->name);
+    g_free(prop->type);
+    g_free(prop->description);
+    g_free(prop);
+}
+```
+
+* 实例级 —— 加到 obj->properties（一个 GHashTable）：
+
+- 这个哈希表在 object_initialize_with_type 中创建（第 568-569 行），key 是属性名的字符串，value
+是 ObjectProperty *，value 的释放函数是 object_property_free。
+- 最终插入发生在第 1283 行：
+
+```c
+
+g_hash_table_insert(obj->properties, prop->name, prop); // 1283
+```
+
+类级 —— 加到 klass->properties（object_class_property_add 函数的第 1321 行）：
+
+```c
+g_hash_table_insert(klass->properties, prop->name, prop);
+```
+
+也是加到htable,
+
+查找时 object_property_find（第 1326-1337 行）先查 class 链（从当前 class 一路查到根
+ObjectClass），再查实例，所以 class-level 属性对所有实例可见，instance-level 属性只属于该实例。
+
+---
+
+命令行参数与属性
+
+`-device e1000,mac=52:54:00:12:34:56,freq=1000000` 的工作链路：
+
+cli opt解析略，解析结果直接存到 `QemuOpts` , 然后传给 `object_new` 对各对象进行初始化；
+在这里，会初始化几个instance？ `e1000` 是一个实例, 还有吗？
+那么，剩下的就是属性了！ 
+```
+object_set_properties_from_qdict(obj, opts)
+  for each key-value:
+    object_property_set(obj, "mac", "52:54:...", &err)
+    prop->set(obj, string_input_visitor, "mac", prop->opaque, &err)
+```
+
+然后就是设备必需的 realize:
+```
+qdev_device_add_from_qdict(opts, &err)
+             └─ device_set_realized(dev, true, &err)
+                  └─ DeviceClass::realize(dev, &err)
+```
+
+## 继承链
+
+`TypeInfo::parent` + name 字符串 锚定继承信息。
+策略依然是 `memcpy + override`
+
+```
+  TYPE_OBJECT ("object")              ← 根类型, abstract
+  │
+  ├─ TYPE_DEVICE ("device")           ← 所有设备的基类, abstract
+  │    │
+  │    ├─ TYPE_SYS_BUS_DEVICE         ← 挂 system bus 的设备, abstract
+  │    │    ├─ "edu"                  ← 一个具体设备
+  │    │    ├─ "serial"               ← 16550 UART
+  │    │    └─ ...
+  │    │
+  │    ├─ TYPE_PCI_DEVICE             ← PCI 设备基类, abstract
+  │    │    ├─ "e1000"                ← Intel e1000 网卡
+  │    │    ├─ "virtio-net-pci"       ← virtio-net PCI 适配器
+  │    │    └─ ...
+  │    │
+  │    └─ (更多设备子类型...)
+  │
+  ├─ TYPE_BUS ("bus")                 ← 总线基类
+  │    ├─ TYPE_PCI_BUS ("PCI")        ← PCI 总线
+  │    ├─ TYPE_SYSTEM_BUS             ← 系统总线
+  │    └─ TYPE_I2C_BUS                ← I2C 总线
+  │
+  ├─ TYPE_MACHINE ("machine")         ← Machine 类型
+  │    ├─ "virt-machine"              ← ARM virt
+  │    ├─ "pc-q35-*"                  ← x86 Q35
+  │    └─ ...
+  │
+  ├─ TYPE_MEMORY_BACKEND ("memory-backend")
+  │    ├─ "memory-backend-ram"
+  │    ├─ "memory-backend-file"
+  │    └─ "memory-backend-memfd"
+  │
+  └─ TYPE_CONTAINER ("container")
+```
+
+[](qemu/qom/lectures/06-type-landscape.html) 可以看详细介绍
+
+## 设备建模简化流程
+
+```c
+#ifndef HELLO_H // toggling
+#define HELLO_H
+
+#include "hw/sysbus.h"
+#incldue "qom/object.h"
+
+#define TYPE_HELLO_DEVICE "hello"
+
+// 先声明，后定义：
+
+OBJECT_DECLARE_TYPE(HelloDeviceInstanceState, HelloDeviceClass, HELLO_DEVICE)
+struct HelloDeviceInstanceState {
+    SysBusDevice parent_obj; /* ★ 必须是第一个字段 */
+    // 自定义字段
+    MemoryRegion mmio;
+    char *message;   // properties
+    uint32_t repeat; // properties
+    uint32_t count;  // private
+};
+
+struct HelloDeviceClass {
+    SysBusDeviceClass parent_class;  /* ★ 必须是第一个字段 */
+    // 简单设备，不设置什么虚函数
+}
+#endif
+```
+
+```c
+static void hello_device_realize(DeviceState *dev, Error **errp) {
+    HelloDeviceInstanceState *s = HELLO_DEVICE(dev);
+    memory_region_init_io(&s->mmio, OBJECT(dev), &hello_mmio_ops, s, "hello.mmio", 0x1000);
+    sysbus_init_mmio(SYS_BUS_DEVICE(dev), &s->mmio);
+}
+static void hello_device_init(Object *obj) {
+    HelloDeviceInstanceState *s = HELLO_DEVICE(obj);
+    s->count = 0; s->repeat = 1; s->message = g_strdup("hello");
+    object_property_add(obj, "message", "str", hello_device_set_message, hello_device_get_message, s, NULL);
+    object_property_add(obj, "repeat", "uint32", hello_device_set_repeat, hello_device_get_repeat, s, NULL);
+}
+// 设置虚函数指针
+static void hello_device_class_init(ObjectClass *klass, void *data) {
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    dc->realize = hello_device_realize;
+    dc->desc = "hello qom dev";
+    dc->user_creatable = true;
+}
+static void hello_device_finalize(Object *obj) {
+    HelloDeviceInstanceState *s = HELLO_DEVICE(obj);
+    g_free(s->message);
+}
+OBJECT_DEFINE_TYPE(HelloDeviceInstanceState, HelloDeviceClass, HELLO_DEVICE, SYS_BUS_DEVICE)
+```
+
+这里 realize 也可以不实现，只是为了好看就写了。
+
+> 关键点: 开发者只需提供三个函数 (_init, _class_init, _finalize) 和一个 struct (HelloDeviceState)。其余全部由宏自动生成。这就是 QOM 的编程范式。
+
+> 源码ready，更新构建系统
+
+```meson
+system_ss.add(when: 'CONFIG_HELLO_DEVICE', if_true: files('hello.c'))
+```
 
 
 # TCGTB
@@ -1749,6 +2331,8 @@ QEMU **ARM 的 virt 更"成熟"**——KVM 集成、NUMA 自动化、NVDIMM、�
 
 
 # 外设建模
+
+又是这个宏：
 
 ```c
 #define TYPE_DEVICE "device"

@@ -26,7 +26,8 @@
 <div class="lecture-layout">
 <aside class="sidebar">
     <h3>本讲内容</h3>
-    <a href="#principle" class="toc-item">原理</a>
+    <a href="#enumeration" class="toc-item">枚举</a>
+    <a href="#bdf" class="toc-item">BDF 与 function</a>
     <a href="#guide" class="toc-item">实验指导</a>
     <div class="exp-list">
         <h3>全部实验</h3>
@@ -49,10 +50,10 @@
 <section id="principle">
 <h2>原理</h2>
 
-<h3>PCI 枚举：从总线扫描到 sysfs</h3>
+<h3 id="enumeration">PCI 枚举：从总线扫描到 sysfs</h3>
 <p>Linux 启动时，PCI 子系统递归扫描每条 PCI 总线（从 bus 00 开始），在每个 device/function 位置读取 <strong>Vendor ID</strong> 和 <strong>Device ID</strong> 寄存器。如果 Vendor ID ≠ 0xFFFF，说明该位置存在一个 function。这就是 <strong>PCI 枚举</strong> 的基本机制。</p>
 
-<p>每个被发现的 function 获得一个不变的 <strong>BDF 地址</strong>（Bus:Device.Function），并在 sysfs 中创建目录：</p>
+<p>每个被发现的 function 在本次枚举中获得一个 <strong>BDF 地址</strong>（Bus:Device.Function），并在 sysfs 中创建目录：</p>
 
 <pre><code>/sys/bus/pci/devices/0000:00:01.0/
 ├── vendor      → "0x1b36"
@@ -62,7 +63,7 @@
 ├── modalias    → 驱动匹配键
 └── config      → 二进制配置空间</code></pre>
 
-<h3>BDF 地址结构</h3>
+<h3 id="bdf">BDF 地址结构</h3>
 <p>一个 PCI 层次地址由三个字段组成：</p>
 <ul>
     <li><strong>Bus (8 bits)</strong>：0-255。Bus 00 是根总线</li>
@@ -70,7 +71,11 @@
     <li><strong>Function (3 bits)</strong>：0-7。每个设备最多 8 个功能</li>
 </ul>
 
-<p>在 QEMU q35 中，<code>bus=pcie.0,addr=0x1</code> 意味着 device=1, function=0。Linux 将其表示为 <code>0000:00:01.0</code>（domain 固定为 0000）。</p>
+<p>在本实验的 QEMU q35 拓扑中，<code>bus=pcie.0,addr=0x1</code> 意味着 device=1, function=0。Linux 将其表示为 <code>0000:00:01.0</code>；这里的 domain 是 0000，但多 Root Complex 或更复杂的平台可以有其他 domain。</p>
+
+<h3>一个插槽位置可以有多个 function</h3>
+<p><strong>function 不是“设备”的同义词</strong>。BDF 中的 device 字段选择总线上的一个位置，function 字段再选择该位置内的功能单元。一个单功能 endpoint 通常只使用 function 0；多功能设备可以在同一 device 位置暴露 function 0–7。Linux、<code>lspci</code> 和 sysfs 都把每个 function 当成独立的 PCI 对象处理。</p>
+<p>本实验的 <code>pci-testdev</code> 恰好只暴露一个 function，所以一条 <code>-device</code> 选项新增一个 sysfs 目录。这个对应关系是本实验的观察结果，不应推广为所有 QEMU 设备或所有硬件设备都只能有一个 function。</p>
 
 <div class="ascii-diagram">
      PCI 枚举过程：
@@ -117,7 +122,7 @@ cat /sys/bus/pci/devices/0000:00:01.0/uevent</code></pre>
 </ul>
 
 <h3>解释</h3>
-<p>一个 <code>-device</code> QEMU 选项 = 一个 PCI function = 一个 sysfs 目录。枚举不要求设备有驱动程序——<strong>只要有配置空间且 Vendor ID 有效，就会被枚举</strong>。</p>
+<p>本实验中的一个 <code>-device pci-testdev</code> 选项对应一个 PCI function 和一个 sysfs 目录。枚举不要求设备有驱动程序——<strong>只要该位置的配置空间返回有效 Vendor ID，就会被枚举</strong>。</p>
 
 <div class="callout callout-tip">
     <strong>提示：</strong>注意 class code 0x00ff00 的含义——它是 QEMU 的测试设备 class，不是存储/网络/显示等标准 class。正是因为没有标准 class，所以没有标准驱动会绑定它。枚举 ≠ 绑定。

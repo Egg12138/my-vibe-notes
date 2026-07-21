@@ -26,8 +26,8 @@
 <div class="lecture-layout">
 <aside class="sidebar">
     <h3>本讲内容</h3>
-    <a href="#principle" class="toc-item">原理</a>
-    <a href="#guide" class="toc-item">实验指导</a>
+    <a href="#bar" class="toc-item">BAR 记录什么</a>
+    <a href="#allocation" class="toc-item">分配与桥窗口</a>
     <div class="exp-list">
         <h3>全部实验</h3>
         <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
@@ -49,8 +49,9 @@
 <section id="principle">
 <h2>原理</h2>
 
-<h3>BAR 是什么</h3>
-<p><strong>BAR (Base Address Register)</strong> 是 PCI 配置空间中偏移 0x10–0x24 的 6 个 32-bit 寄存器。它们告诉 BIOS/OS：设备需要什么类型的内存或 I/O 空间、需要多大、以及这些空间应该映射到物理地址空间的什么位置。</p>
+<h3 id="bar">BAR 是什么</h3>
+<p><strong>BAR (Base Address Register)</strong> 是 Type 0 PCI 配置空间中偏移 0x10–0x24 的 6 个 32-bit 寄存器。<strong>BAR 本身保存的是已分配的基地址和属性</strong>：它告诉软件这段资源是 Memory 还是 I/O、是否可预取、是否为 64-bit 地址，以及当前被放在 CPU 物理地址空间的哪里。</p>
+<p>“设备需要多大空间”不是从 BAR 的普通当前值直接读出的。固件或 OS 在分配阶段会使用 BAR sizing 协议探测可写掩码，随后选择一个地址并写回 BAR。本讲不做这个探测，因为向真实工作的 BAR 写全 1 会暂时改变设备可见的地址；我们改读 Linux 已完成分配后的 <code>resource</code> 文件。</p>
 
 <h3>BAR 的编码方式</h3>
 <p>BAR 的低位是<strong>只读属性位</strong>，不是地址的一部分：</p>
@@ -63,9 +64,9 @@
     <tr><td>31-4</td><td><strong>基地址</strong>（4KB 对齐）</td></tr>
 </table>
 
-<p>要得到基地址，需要 mask 掉低 4 位：<code>base = raw_bar & ~0xf</code>。</p>
+<p>要得到基地址，需要 mask 掉低 4 位：<code>base = raw_bar &amp; ~0xf</code>。</p>
 
-<h3>地址空间层级</h3>
+<h3 id="allocation">地址空间层级：分配与转发</h3>
 <p>Linux 的资源分配遵循桥窗口嵌套原则：</p>
 
 <div class="ascii-diagram">
@@ -77,10 +78,10 @@
        fea00000-fea03fff : 0000:01:00.0          ← 端点 BAR4/5（64-bit 预取）
 </div>
 
-<p>桥窗口<strong>包含</strong>其下级设备的所有 MMIO 范围。CPU 访问落在窗口内的地址时，桥将事务转发到其下级总线。</p>
+<p>桥窗口<strong>包含</strong>其下级设备的所有 MMIO 范围。CPU 访问落在窗口内的地址时，桥将事务转发到其下级总线。因而资源分配有两个相连的结果：endpoint 的 BAR 获得具体地址，Type 1 bridge 的窗口覆盖这些下游地址。实验 03 的树形拓扑在这里变成了树形的地址范围。</p>
 
-<h3>Bar Sizing 机制</h3>
-<p>BAR 的大小通过写全 1 再读回来确定：<code>size = ~(read_back_after_write_all_ones & ~0xf) + 1</code>。但本实验不执行 BAR sizing（会破坏性地修改 BAR 值），而是通过 Linux 的 <code>resource</code> 文件间接获取 size。</p>
+<h3>BAR sizing 机制</h3>
+<p>BAR 的大小通过写全 1 再读回来确定：<code>size = ~(read_back_after_write_all_ones &amp; ~0xf) + 1</code>。但本实验不执行 BAR sizing（会破坏性地修改 BAR 值），而是通过 Linux 的 <code>resource</code> 文件间接获取 size。</p>
 </section>
 
 <section id="guide">

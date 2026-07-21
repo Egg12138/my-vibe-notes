@@ -26,8 +26,9 @@
 <div class="lecture-layout">
 <aside class="sidebar">
     <h3>本讲内容</h3>
-    <a href="#principle" class="toc-item">原理</a>
-    <a href="#guide" class="toc-item">实验指导</a>
+    <a href="#lifecycle" class="toc-item">枚举与绑定</a>
+    <a href="#match" class="toc-item">匹配键</a>
+    <a href="#sysfs-bind" class="toc-item">sysfs 绑定</a>
     <div class="exp-list">
         <h3>全部实验</h3>
         <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
@@ -49,12 +50,12 @@
 <section id="principle">
 <h2>原理</h2>
 
-<h3>两条独立的路径</h3>
+<h3 id="lifecycle">两条独立的路径</h3>
 <p>Linux PCI 子系统中，<strong>枚举</strong>和<strong>驱动绑定</strong>是两个完全分离的阶段：</p>
 
 <ol>
-    <li><strong>枚举</strong>：PCI 核心扫描总线，发现 Vendor ID ≠ 0xFFFF 时创建 <code>struct pci_dev</code>。设备存在完全由<strong>硬件存在性</strong>决定。</li>
-    <li><strong>驱动绑定</strong>：驱动注册时，PCI 核心将驱动的 <code>id_table</code>（vendor:device 匹配表）与每个未绑定设备比较。匹配成功 → 调用驱动的 <code>probe()</code> → 建立绑定。</li>
+    <li><strong>枚举</strong>：PCI 核心扫描总线，发现 Vendor ID ≠ 0xFFFF 时创建 <code>struct pci_dev</code>。这个对象的存在由总线扫描和设备可达性决定。</li>
+    <li><strong>驱动绑定</strong>：驱动注册时，PCI 核心将驱动的 <code>id_table</code> 与每个未绑定设备比较。匹配成功 → 调用驱动的 <code>probe()</code> → 建立绑定。</li>
 </ol>
 
 <div class="ascii-diagram">
@@ -76,12 +77,12 @@
         └──────────── 等待驱动 ──────→ bind
 </div>
 
-<h3>Match Key: modalias</h3>
+<h3 id="match">Match Key: modalias</h3>
 <p>每个 PCI 设备的 <code>modalias</code> 文件包含完整的匹配键：</p>
 <pre><code>pci:v00001AF4d00001044sv00001AF4sd00001100bc00scFFi00</code></pre>
-<p>每个字段：<code>v</code>=vendor, <code>d</code>=device, <code>sv</code>=subsystem vendor, <code>sd</code>=subsystem device, <code>bc</code>=base class, <code>sc</code>=sub class。驱动在 <code>struct pci_device_id</code> 表中声明支持的 vendor/device 组合。</p>
+<p>每个字段：<code>v</code>=vendor, <code>d</code>=device, <code>sv</code>=subsystem vendor, <code>sd</code>=subsystem device, <code>bc</code>=base class, <code>sc</code>=sub class。驱动可以按 <strong>vendor/device、子系统 ID 或 class</strong> 等字段声明可接受的 function；<code>modalias</code> 把这些属性编码成可供模块自动加载和驱动核心匹配的字符串。</p>
 
-<h3>sysfs 绑定接口</h3>
+<h3 id="sysfs-bind">sysfs 绑定接口</h3>
 <p>每个 PCI 驱动的 sysfs 目录下有 <code>bind</code> 和 <code>unbind</code> 文件，允许用户空间手动控制绑定状态：</p>
 <pre><code>/sys/bus/pci/drivers/virtio-pci/
 ├── bind      ← 写入 BDF 来绑定设备

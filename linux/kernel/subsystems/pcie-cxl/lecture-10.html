@@ -26,8 +26,9 @@
 <div class="lecture-layout">
 <aside class="sidebar">
     <h3>本讲内容</h3>
-    <a href="#principle" class="toc-item">原理</a>
-    <a href="#guide" class="toc-item">实验指导</a>
+    <a href="#states" class="toc-item">三种状态</a>
+    <a href="#path" class="toc-item">解码路径</a>
+    <a href="#decoder-state" class="toc-item">HDM decoder</a>
     <div class="exp-list">
         <h3>全部实验</h3>
         <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
@@ -49,8 +50,11 @@
 <section id="principle">
 <h2>原理</h2>
 
-<h3>CXL 内存寻址栈</h3>
-<p>CXL.mem 的内存映射遵循一个<strong>四层解码器模型</strong>，从上到下将系统物理地址 (SPA) 转换为设备物理地址 (DPA)：</p>
+<h3 id="states">已发现、已保留、已可用</h3>
+<p>这三个状态不能混为一谈。<strong>已发现、已保留、已可用</strong>分别回答不同的问题：内核是否识别出 <code>mem0</code> 及其容量；平台是否在系统物理地址空间中保留 CFMW；以及一条 decoder 路径和 region 是否已经把这段地址实际指向设备容量。它们在某些机器上可能由固件一次完成，在本实验的 QEMU + 内核组合中则清楚地停在中间状态。</p>
+
+<h3 id="path">CXL 内存寻址路径</h3>
+<p>CXL.mem 的地址路径从系统物理地址 (SPA) 出发，经过平台 CFMW、root/port decoder 和 endpoint HDM decoder，最终落到设备物理地址 (DPA)。<strong>CXL region 不是第四个硬件 decoder</strong>，而是 Linux 对一条已配置解码路径及其可用地址范围的管理对象：</p>
 
 <div class="ascii-diagram">
      系统物理地址 (SPA)
@@ -72,12 +76,12 @@
      │  HDM = Host-managed Device Memory
      │  将 SPA 范围映射到设备的内部 DPA
      ▼
-     CXL Region (可消费的内存)
+     CXL Region（Linux 管理对象）
         /sys/bus/cxl/devices/region*
-        内核创建用于表示可用的 CXL 内存
+        表示一条已经配置的地址路径
 </div>
 
-<h3>HDM Decoder 状态</h3>
+<h3 id="decoder-state">HDM Decoder 状态</h3>
 <p>每个 HDM decoder 有 4 个关键属性和一个状态生命周期：</p>
 
 <table>
@@ -89,20 +93,20 @@
     <tr><td><code>target_type</code></td><td>"expander" = Type 3 内存设备</td></tr>
 </table>
 
-<p>解码器生命周期：<strong>枚举 (start=0,size=0) → 编程 (start=addr,size=N) → 提交 (committed=1)</strong>。提交后的解码器才能由 OS 使用。</p>
+<p>一个典型的 decoder 生命周期是：<strong>被发现 → 编程 (start=addr,size=N) → 提交 (committed=1)</strong>。具体 sysfs 属性和状态取决于 decoder 所在层级；只有完整路径被配置并提交后，Linux 才能把它组装为可用的 region。</p>
 
 <h3>枚举 ≠ 编程</h3>
 <p>这是本实验最重要的一条认知。实验 09 展示了 CXL 设备<strong>被枚举</strong>——我们知道它存在、知道它的容量。但枚举并不会自动创建可寻址的内存。编程序列是：</p>
 
 <ol>
     <li>枚举发现设备容量（ram/size = 256MB）</li>
-    <li>固件或 OS 从 CFMW 中分配地址空间给 HDM decoder</li>
-    <li>将地址范围写入 decoder 的 start/size 寄存器</li>
-    <li>设置 committed=1 以激活映射</li>
-    <li>内核创建 CXL region 以表示可用内存</li>
+    <li>固件或 OS 从 CFMW 中分配地址空间给 decoder 路径</li>
+    <li>逐层配置地址范围和下游目标</li>
+    <li>提交 endpoint HDM decoder 以激活设备侧映射</li>
+    <li>Linux 创建并管理 CXL region，以表示这段可用地址范围</li>
 </ol>
 
-<p><strong>在本 QEMU + 内核组合中，HDM decoder 停留在步骤 1</strong>（未编程状态）。这是有意为之——它揭示了 CXL 内存是一个需要显式编程的<strong>两层协议</strong>，而不是一个即插即用的 I/O 设备。</p>
+<p><strong>在本 QEMU + 内核组合中，endpoint HDM decoder 仍未编程</strong>。这让我们直接观察到：CXL 内存不是仅凭 PCIe 枚举就能即插即用的 I/O 设备，设备发现和地址可用性之间还隔着显式的解码配置。</p>
 </section>
 
 <section id="guide">
@@ -154,7 +158,7 @@ grep "CXL Window" /proc/iomem</code></pre>
 <p>平台已经为 CXL 保留了 4GB 的物理地址空间 (CFMW)，并且知道设备有 256MB 的 RAM 容量。但二者之间缺少了关键的连接——<strong>HDM decoder 还没有被编程</strong>。解码器的 start=0、size=0 说明设备尚未被分配 CFMW 中的具体地址范围。这就是 "枚举 ≠ 编程" 的含义：知道设备存在、知道它有多大距离"让 CPU 可以访问它"还差编程这一步骤。</p>
 
 <div class="callout callout-info">
-    <strong>在真实系统中：</strong>固件或 OS 会通过 CXL mailbox 命令对 HDM decoder 进行编程（设置 start/size → commit → 创建 region）。QEMU 8.2 的默认行为不自动编程 decoder，正好让我们观察这个关键的中间状态。
+    <strong>在真实系统中：</strong>固件和 OS 会协作完成 CXL 地址窗口、decoder 与 region 的配置；具体由平台固件、内核和 CXL 用户空间共同决定。本项目的 QEMU + 内核组合不自动完成 endpoint decoder 编程，正好让我们观察这个关键的中间状态。
 </div>
 </section>
 

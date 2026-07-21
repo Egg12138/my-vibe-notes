@@ -26,8 +26,9 @@
 <div class="lecture-layout">
 <aside class="sidebar">
     <h3>本讲内容</h3>
-    <a href="#principle" class="toc-item">原理</a>
-    <a href="#guide" class="toc-item">实验指导</a>
+    <a href="#delivery" class="toc-item">中断投递方式</a>
+    <a href="#capability" class="toc-item">能力链表</a>
+    <a href="#msix" class="toc-item">MSI-X 结构</a>
     <div class="exp-list">
         <h3>全部实验</h3>
         <a href="lecture-01.html" class="exp-link">01 WSL2 vs QEMU</a>
@@ -49,7 +50,11 @@
 <section id="principle">
 <h2>原理</h2>
 
-<h3>PCI 能力链表</h3>
+<h3 id="delivery">INTx、MSI 与 MSI-X</h3>
+<p>传统 INTx 使用共享的中断引脚和平台中断控制器，驱动需要确认并清除设备的中断原因。MSI 则让设备向 OS 分配的 APIC 地址发出一笔带数据的 Memory Write 事务，从而通知一个中断向量；它不是普通的 PCIe Message TLP。MSI-X 在 MSI 的思路上提供一张位于 BAR 中的向量表，使不同队列能够使用独立的地址、数据和屏蔽位。</p>
+<p>本讲观察的是 virtio-rng 驱动绑定后选择并启用 MSI-X 的结果。MSI-X 是一种能力，不是所有 PCIe function 都必须支持或使用的唯一中断方式。</p>
+
+<h3 id="capability">PCI 能力链表</h3>
 <p>PCI 设备通过配置空间中的<strong>能力链表 (Capability Linked List)</strong> 来通告可选功能。链表从偏移 0x34 开始（Type 0 header 的 Capabilities Pointer）。每个能力条目有两个标准字节：</p>
 
 <table>
@@ -68,8 +73,8 @@
     <tr><td>0x11</td><td>MSI-X</td></tr>
 </table>
 
-<h3>MSI-X 能力结构</h3>
-<p>MSI-X 是 PCIe 设备的主要中断机制。它的能力条目结构如下：</p>
+<h3 id="msix">MSI-X 能力结构</h3>
+<p>MSI-X capability 告诉 OS 向量表和 pending-bit array 位于哪个 BAR 的什么位置。它的能力条目结构如下：</p>
 
 <div class="ascii-diagram">
      MSI-X Capability 结构（12 字节）：
@@ -80,14 +85,14 @@
             └────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┴────┘
              0x11
                     ├──bits 0-10──┤├15┤├bit 2:0──┤├─bits 31:3──┤
-                       Table Size   En  BAR index   Qword offset
+                       Table Size   En  BAR index   Byte offset
 </div>
 
 <ul>
     <li><strong>Table Size</strong>：MSI-X 向量数 - 1（例如值 3 = 4 个向量）</li>
     <li><strong>Enable (bit 15)</strong>：1 = MSI-X 已启用</li>
     <li><strong>Table BIR (bits 2:0)</strong>：MSI-X 表所在的 BAR 编号（0-5）</li>
-    <li><strong>Table Offset (bits 31:3)</strong>：该 BAR 内 MSI-X 表的 qword 偏移（8 字节对齐）</li>
+    <li><strong>Table Offset (bits 31:3)</strong>：该 BAR 内的字节偏移；最低 3 bit 为 0，所以表起点按 8 字节对齐</li>
 </ul>
 
 <h3>中断与驱动生命周期</h3>

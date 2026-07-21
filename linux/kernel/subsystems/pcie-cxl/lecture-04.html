@@ -26,7 +26,8 @@
 <div class="lecture-layout">
 <aside class="sidebar">
     <h3>本讲内容</h3>
-    <a href="#principle" class="toc-item">原理</a>
+    <a href="#contract" class="toc-item">配置空间契约</a>
+    <a href="#scan" class="toc-item">扫描从哪里开始</a>
     <a href="#guide" class="toc-item">实验指导</a>
     <div class="exp-list">
         <h3>全部实验</h3>
@@ -49,8 +50,8 @@
 <section id="principle">
 <h2>原理</h2>
 
-<h3>配置空间：设备的"身份证"</h3>
-<p>每个 PCI/PCIe function 都有 256 字节（PCIe 扩展到 4KB）的<strong>配置空间</strong>。前 64 字节是<strong>标准化头部</strong>，包含操作系统识别和配置设备所需的所有基本信息。</p>
+<h3 id="contract">配置空间：操作系统与 function 的契约</h3>
+<p>每个 PCI function 都实现前 256 字节的<strong>标准配置空间</strong>。PCIe 平台通常还能通过增强配置访问机制暴露最多 4KB 的配置空间；本实验只读取所有 PCI function 都必须先回答的前 64 字节<strong>标准化头部</strong>，其中包含操作系统识别和配置设备所需的基本信息。</p>
 
 <p>Linux 通过 sysfs 将配置空间暴露为二进制文件：</p>
 <pre><code>/sys/bus/pci/devices/0000:00:01.0/config</code></pre>
@@ -67,6 +68,9 @@
     <tr><td>0x10–0x24</td><td>24</td><td>BARs</td><td>6 × 32-bit</td><td>2 × 32-bit</td></tr>
     <tr><td>0x18</td><td>4</td><td>Bus Numbers</td><td>—</td><td>Pri/Sec/Sub</td></tr>
 </table>
+
+<h3 id="scan">PCI 根总线从哪里开始扫描</h3>
+<p>读取 Vendor ID 是枚举的核心动作，但 Linux 不能凭空知道从哪条总线开始。平台固件通过 ACPI 等机制提供 PCI 根总线、可用资源和中断路由；PCI 核心从这些根出发扫描，遇到 Type 1 bridge 后才继续进入它的 secondary bus。驱动程序不参与这个发现过程，但平台描述仍是起点。</p>
 
 <p><strong>Header Type 字节</strong>（偏移 0x0e）的 bit 7 是多功能标志，bits 6-0 指示头部类型：0x00 = Type 0（端点），0x01 = Type 1（PCI-to-PCI bridge）。</p>
 
@@ -127,7 +131,7 @@ hexdump -C -n 64 /sys/bus/pci/devices/0000:01:00.0/config</code></pre>
 <p>Type 1 头部（Root Port）比 Type 0 头部（端点）多了总线编号字段（0x18）。这就是内核如何发现拓扑层级的——通过读取每个设备的 Header Type 字节，内核知道该设备是终端设备（Type 0）还是桥（Type 1），从而决定是否继续扫描其下级总线。</p>
 
 <div class="callout callout-info">
-    <strong>关键认知：</strong>PCI 枚举的整个过程可以简化为：读取 Vendor ID → 非 0xFFFF → 读取 Header Type → Type 1 就扫描新总线 → 重复。不需要任何驱动程序或 ACPI 表就能完成。
+    <strong>关键认知：</strong>从已知的 PCI 根总线开始，枚举可以简化为：读取 Vendor ID → 非 0xFFFF → 读取 Header Type → Type 1 就扫描新总线 → 重复。它不需要设备驱动程序；根总线和资源信息则由平台提供。
 </div>
 </section>
 

@@ -20,7 +20,7 @@
 
 <header class="hero">
     <h1>PCIe &amp; CXL 教学课件</h1>
-    <p class="subtitle">通过 9 个实验，从 PCI 枚举到 CXL 内存语义，逐层理解现代 I/O 协议栈</p>
+    <p class="subtitle">通过 9 个实验，从虚拟 PCI 视图到 CXL 内存语义，逐层理解现代 I/O 协议栈</p>
     <div class="badge-row">
         <span class="badge">QEMU q35</span>
         <span class="badge">Linux Kernel</span>
@@ -32,6 +32,22 @@
 </header>
 
 <main class="container">
+
+    <section aria-labelledby="learning-path">
+        <div class="section-header">
+            <h2 id="learning-path">学习路线</h2>
+            <span class="section-count">先建立模型，再解释观察</span>
+        </div>
+        <p>每个实验都从 Linux 能观察到的对象出发，但课程不把命令输出当作结论。先区分 guest 看见的虚拟 PCI 视图与物理硬件；再用配置空间、BDF 和桥解释设备如何被发现；随后用 BAR、驱动和中断解释设备如何被使用；最后把同一套 PCIe 基础带到 CXL 的内存寻址路径。</p>
+        <ol>
+            <li><strong>设备如何被看见：</strong>实验 01–04 建立虚拟化边界、枚举、BDF、桥和配置空间的模型。</li>
+            <li><strong>设备如何被使用：</strong>实验 05–07 连接 MMIO 地址、驱动生命周期和 MSI/MSI-X 中断。</li>
+            <li><strong>内存如何变得可访问：</strong>实验 09–10 说明 CXL 如何复用 PCIe 发现设备，并额外完成地址解码与 region 编程。</li>
+        </ol>
+        <div class="callout callout-info">
+            <strong>阅读方法：</strong>先读每讲的“原理”，预测 Linux 会暴露什么对象，再运行已有实验。若输出与模型不一致，优先检查这是平台或 QEMU 的虚拟化行为，还是概念本身。
+        </div>
+    </section>
 
     <div class="section-header">
         <h2>Part 1: PCI Express 基础</h2>
@@ -57,7 +73,7 @@
         <div class="card">
             <div class="card-num">Experiment 03</div>
             <a href="lecture-03.html"><div class="card-title">PCIe Root Port 与端点</div></a>
-            <div class="card-desc">引入 Root Port 桥和端点设备，学习 PCIe 拓扑层级、总线编号空间和 sysfs 父子路径。</div>
+            <div class="card-desc">从独立全双工 Lane、分层 TLP 传输讲到 Root Port 路由，再观察 PCIe 拓扑、总线编号和 sysfs 父子路径。</div>
             <div class="card-tags"><span class="card-tag tag-pcie">PCIe</span></div>
         </div>
 
