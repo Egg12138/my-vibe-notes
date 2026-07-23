@@ -597,7 +597,7 @@ qdev_device_add_from_qdict(opts, &err)
   └─ TYPE_CONTAINER ("container")
 ```
 
-[](qemu/qom/lectures/06-type-landscape.html) 可以看详细介绍
+[](../../html-lectures/qemu/qom/lectures/06-type-landscape.html) 可以看详细介绍
 
 ## 设备建模简化流程
 
